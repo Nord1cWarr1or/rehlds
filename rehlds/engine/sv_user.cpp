@@ -1228,6 +1228,10 @@ entity_state_t *SV_FindEntInPack(int index, packet_entities_t *pack)
 	return NULL;
 }
 
+#ifdef REHLDS_FIXES
+static client_bone_state_t SV_StudioUnlagSlerpBones(const client_bone_state_t *from, const client_bone_state_t *to, float t);
+#endif
+
 void SV_SetupMove(client_t *_host_client)
 {
 	struct client_s *cl;
