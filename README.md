@@ -101,6 +101,7 @@ This means that plugins that do binary code analysis (Orpheu for example) probab
 <li>sv_rehlds_movecmdtime_min_scale // Defines the min client's base game speed ratio. Clients slowing the game down below this multiplier will receive warnings. Default: 0.5
 <li>sv_rehlds_movecmdtime_max_warnings // Maximum allowed speedhack/slowmo warnings before the punishment is applied. -1 - disable detection. Default: -1
 <li>sv_rehlds_movecmdtime_punish // Time in minutes for which the player will be banned for speedhacking/slowing (-1 - Kick, 0 - Permanent, use a negative number for a kick). Default: -1
+<li>sv_bone_unlag &lt;1|0&gt; // Cache and restore bone transforms during lag compensation so hitboxes match what the shooter saw. Requires sv_unlag 1. Default: 0
 </ul>
 </details>
 
