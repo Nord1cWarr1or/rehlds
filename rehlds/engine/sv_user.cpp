@@ -54,6 +54,9 @@ cvar_t sv_footsteps = { "mp_footsteps", "1", FCVAR_SERVER, 0.0f, NULL };
 cvar_t sv_rollspeed = { "sv_rollspeed", "0.0", 0, 0.0f, NULL };
 cvar_t sv_rollangle = { "sv_rollangle", "0.0", 0, 0.0f, NULL };
 cvar_t sv_unlag = { "sv_unlag", "1", 0, 0.0f, NULL };
+#ifdef REHLDS_FIXES
+cvar_t sv_bone_unlag = { "sv_bone_unlag", "0", 0, 0.0f, NULL };
+#endif
 cvar_t sv_maxunlag = { "sv_maxunlag", "0.5", 0, 0.0f, NULL };
 cvar_t sv_unlagpush = { "sv_unlagpush", "0.0", 0, 0.0f, NULL };
 cvar_t sv_unlagsamples = { "sv_unlagsamples", "1", 0, 0.0f, NULL };
@@ -1080,6 +1083,10 @@ void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd, qboolean fCho
 
 	if (!host_client->fakeclient)
 		SV_RestoreMove(host_client);
+
+#ifdef REHLDS_FIXES
+	SV_SaveBoneState(host_client, sv_player);
+#endif
 }
 
 int SV_ValidateClientCommand(char *pszCommand)
@@ -1412,6 +1419,20 @@ void SV_SetupMove(client_t *_host_client)
 
 		pnextstate = SV_FindEntInPack(state->number, &frame->entities);
 
+#ifdef REHLDS_FIXES
+		if (nextFrame->bonestate.valid)
+		{
+			if (frame->bonestate.valid)
+				pos->bonestate = SV_StudioUnlagSlerpBones(&frame->bonestate, &nextFrame->bonestate, frac);
+			else
+				pos->bonestate = nextFrame->bonestate;
+		}
+		else
+		{
+			pos->bonestate.valid = false;
+		}
+#endif
+
 		if (pnextstate)
 		{
 			delta[0] = pnextstate->origin[0] - state->origin[0];
@@ -1478,6 +1499,10 @@ void SV_RestoreMove(client_t *_host_client)
 			Con_DPrintf("SV_RestoreMove:  Tried to restore 'inactive' player %i/%s\n", i, &cli->name[4]);
 			continue;
 		}
+
+#ifdef REHLDS_FIXES
+		pos->bonestate.valid = false;
+#endif
 
 		if (VectorCompare(pos->initial_correction_org, cli->edict->v.origin))
 		{
@@ -2018,3 +2043,155 @@ void SV_FullUpdate_f(void)
 	gEntityInterface.pfnClientCommand(sv_player);
 #endif // REHLDS_FIXES
 }
+
+#ifdef REHLDS_FIXES
+static void MatrixQuaternion(const float matrix[3][4], vec4_t quaternion)
+{
+	float trace = matrix[0][0] + matrix[1][1] + matrix[2][2];
+
+	if (trace > 0.0f)
+	{
+		float s = sqrtf(trace + 1.0f) * 2.0f;
+		float invs = 1.0f / s;
+		quaternion[0] = (matrix[2][1] - matrix[1][2]) * invs;
+		quaternion[1] = (matrix[0][2] - matrix[2][0]) * invs;
+		quaternion[2] = (matrix[1][0] - matrix[0][1]) * invs;
+		quaternion[3] = s * 0.25f;
+	}
+	else if (matrix[0][0] > matrix[1][1] && matrix[0][0] > matrix[2][2])
+	{
+		float s = sqrtf(1.0f + matrix[0][0] - matrix[1][1] - matrix[2][2]) * 2.0f;
+		float invs = 1.0f / s;
+		quaternion[0] = s * 0.25f;
+		quaternion[1] = (matrix[0][1] + matrix[1][0]) * invs;
+		quaternion[2] = (matrix[0][2] + matrix[2][0]) * invs;
+		quaternion[3] = (matrix[2][1] - matrix[1][2]) * invs;
+	}
+	else if (matrix[1][1] > matrix[2][2])
+	{
+		float s = sqrtf(1.0f + matrix[1][1] - matrix[0][0] - matrix[2][2]) * 2.0f;
+		float invs = 1.0f / s;
+		quaternion[0] = (matrix[0][1] + matrix[1][0]) * invs;
+		quaternion[1] = s * 0.25f;
+		quaternion[2] = (matrix[1][2] + matrix[2][1]) * invs;
+		quaternion[3] = (matrix[0][2] - matrix[2][0]) * invs;
+	}
+	else
+	{
+		float s = sqrtf(1.0f + matrix[2][2] - matrix[0][0] - matrix[1][1]) * 2.0f;
+		float invs = 1.0f / s;
+		quaternion[0] = (matrix[0][2] + matrix[2][0]) * invs;
+		quaternion[1] = (matrix[1][2] + matrix[2][1]) * invs;
+		quaternion[2] = s * 0.25f;
+		quaternion[3] = (matrix[1][0] - matrix[0][1]) * invs;
+	}
+
+	float len = sqrtf(quaternion[0] * quaternion[0] + quaternion[1] * quaternion[1] +
+	                  quaternion[2] * quaternion[2] + quaternion[3] * quaternion[3]);
+	if (len > 0.0f)
+	{
+		float invlen = 1.0f / len;
+		quaternion[0] *= invlen;
+		quaternion[1] *= invlen;
+		quaternion[2] *= invlen;
+		quaternion[3] *= invlen;
+	}
+	else
+	{
+		quaternion[0] = quaternion[1] = quaternion[2] = 0.0f;
+		quaternion[3] = 1.0f;
+	}
+}
+
+static void LerpBoneMatrix(const float from[3][4], const float to[3][4], float t, float out[3][4])
+{
+	vec4_t q1, q2, q3;
+
+	MatrixQuaternion(from, q1);
+	MatrixQuaternion(to, q2);
+	QuaternionSlerp(q1, q2, t, q3);
+	QuaternionMatrix(q3, out);
+
+	float backlerp = 1.0f - t;
+	out[0][3] = from[0][3] * backlerp + to[0][3] * t;
+	out[1][3] = from[1][3] * backlerp + to[1][3] * t;
+	out[2][3] = from[2][3] * backlerp + to[2][3] * t;
+}
+
+static client_bone_state_t SV_StudioUnlagSlerpBones(const client_bone_state_t *from, const client_bone_state_t *to, float t)
+{
+	client_bone_state_t ret;
+
+	ret.valid = true;
+	ret.numbones = from->numbones;
+
+	for (int i = 0; i < from->numbones; i++)
+	{
+		LerpBoneMatrix(from->bonetransform[i], to->bonetransform[i], t, ret.bonetransform[i]);
+	}
+
+	LerpBoneMatrix(from->rotationmatrix, to->rotationmatrix, t, ret.rotationmatrix);
+
+	return ret;
+}
+
+void SV_SaveBoneState(client_t *_host_client, const edict_t *edict)
+{
+	int num = NUM_FOR_EDICT(edict);
+	client_frame_t *frame;
+
+	if (!SV_IsPlayerIndex(num))
+		return;
+
+	frame = &_host_client->frames[SV_UPDATE_MASK & (_host_client->netchan.outgoing_sequence)];
+
+	if (g_psv.models[edict->v.modelindex]->type != mod_studio)
+	{
+		frame->bonestate.valid = false;
+		return;
+	}
+
+	studiohdr_t *hdr = (studiohdr_t *)Mod_Extradata(g_psv.models[edict->v.modelindex]);
+	if (!hdr)
+	{
+		frame->bonestate.valid = false;
+		return;
+	}
+
+	g_pSvBlendingAPI->SV_StudioSetupBones(
+		g_psv.models[edict->v.modelindex],
+		edict->v.frame, edict->v.sequence, edict->v.angles, edict->v.origin,
+		edict->v.controller, edict->v.blending, -1, edict
+	);
+
+	frame->bonestate.valid = true;
+	frame->bonestate.numbones = hdr->numbones;
+	Q_memcpy(frame->bonestate.bonetransform, bonetransform, sizeof(bonetransform));
+	Q_memcpy(frame->bonestate.rotationmatrix, rotationmatrix, sizeof(rotationmatrix));
+}
+
+void SV_StudioSetupUnlagBones(model_t *pModel, float frame, int sequence, const vec_t *angles, const vec_t *origin, const unsigned char *pcontroller, const unsigned char *pblending, int iBone, const edict_t *edict)
+{
+	if (edict && sv_bone_unlag.value)
+	{
+		if (!nofind)
+		{
+			if (edict->v.flags & FL_CLIENT)
+			{
+				int num = NUM_FOR_EDICT(edict);
+
+				if (truepositions[num].active &&
+					!truepositions[num].needrelink &&
+					truepositions[num].bonestate.valid)
+				{
+					Q_memcpy(bonetransform, truepositions[num].bonestate.bonetransform, sizeof(bonetransform));
+					Q_memcpy(rotationmatrix, truepositions[num].bonestate.rotationmatrix, sizeof(rotationmatrix));
+					return;
+				}
+			}
+		}
+	}
+
+	g_pSvBlendingAPI->SV_StudioSetupBones(pModel, frame, sequence, angles, origin, pcontroller, pblending, iBone, edict);
+}
+#endif // REHLDS_FIXES
