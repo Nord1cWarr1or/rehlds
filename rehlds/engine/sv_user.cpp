@@ -776,6 +776,15 @@ void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd, qboolean fCho
 	trace_t trace;
 	float frametime;
 
+#ifdef REHLDS_FIXES
+	// Issue #1198: CheckLimits()/game-DLL callbacks may SV_DropClient() while
+	// SV_ParseMove() still iterates usercmds; edict is then NULL. connected is
+	// always cleared by SV_DropClient (with active/spawned/edict) and stays
+	// TRUE for fakeclients, so it reliably guards all SV_RunCmd call sites.
+	if (!host_client->connected)
+		return;
+#endif // REHLDS_FIXES
+
 	if (host_client->ignorecmdtime > realtime)
 	{
 		host_client->cmdtime = (double)ucmd->msec / 1000.0 + host_client->cmdtime;
@@ -1730,6 +1739,10 @@ void SV_ParseMove(client_t *pSenderClient)
 	}
 
 #ifdef REHLDS_FIXES
+	// Issue #1198: skip post-loop bookkeeping if dropped mid-loop above.
+	if (!host_client->connected)
+		return;
+
 	if (numcmds)
 		host_client->lastcmd = cmds[numcmds - 1];
 	else if (numbackup)
