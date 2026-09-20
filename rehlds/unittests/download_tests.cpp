@@ -150,3 +150,60 @@ TEST(OverlongPathRejected, Download, 1000)
 		SV_GetRequestedDownloadName(namebuf, sizeof(namebuf)) == NULL);
 }
 #endif // REHLDS_FIXES
+
+// A duplicate dlfile request for a file that is already queued or in flight
+// must be detected, so it can be ignored instead of queued again (issue #1200).
+TEST(FileTransferActiveDetection, Download, 1000)
+{
+	EngineInitializer engInitGuard;
+
+	netchan_t chan;
+	Q_memset(&chan, 0, sizeof(chan));
+
+	CHECK("Idle channel has no active transfer", !Netchan_IsFileTransferActive(&chan, "models/model.mdl"));
+
+	// Queue a stub the way Netchan_CreateFileFragments does.
+	auto wait = (fragbufwaiting_t *)Mem_ZeroMalloc(sizeof(fragbufwaiting_t));
+	auto buf = (fragbuf_t *)Mem_ZeroMalloc(sizeof(fragbuf_t));
+	Q_strncpy(buf->filename, "models/model.mdl", sizeof(buf->filename) - 1);
+	buf->filename[sizeof(buf->filename) - 1] = 0;
+	wait->fragbufs = buf;
+	chan.waitlist[FRAG_FILE_STREAM] = wait;
+
+	CHECK("Queued file should be detected", Netchan_IsFileTransferActive(&chan, "models/model.mdl"));
+	CHECK("Detection should ignore case", Netchan_IsFileTransferActive(&chan, "MODELS/MODEL.MDL"));
+	CHECK("Other files must not be flagged", !Netchan_IsFileTransferActive(&chan, "models/other.mdl"));
+
+	// Move the stub into the in-flight head, the state Netchan_FragSend leaves.
+	auto inflight = (fragbuf_t *)Mem_ZeroMalloc(sizeof(fragbuf_t));
+	Q_strncpy(inflight->filename, "sound/ambient.wav", sizeof(inflight->filename) - 1);
+	inflight->filename[sizeof(inflight->filename) - 1] = 0;
+	chan.fragbufs[FRAG_FILE_STREAM] = inflight;
+	chan.waitlist[FRAG_FILE_STREAM] = NULL;
+
+	CHECK("In-flight file should be detected", Netchan_IsFileTransferActive(&chan, "sound/ambient.wav"));
+}
+
+// The dlfile token bucket absorbs a full connect batch and drops requests
+// once it runs dry; tokens are restored over time and on every 'new' (issue #1200).
+TEST(DlFileTokenBucket, Download, 1000)
+{
+	g_psv.num_resources = 0;
+	realtime = 1000.0;
+	g_DlFileRateLimiter.ClientConnected(0);
+
+	// default bucket is auto-sized: num_resources + margin = 16 tokens
+	for (int i = 0; i < 16; i++)
+		CHECK("Bucket should hold the whole connect batch", !g_DlFileRateLimiter.DlFileIssued(0));
+	CHECK("Empty bucket must drop the request", g_DlFileRateLimiter.DlFileIssued(0));
+
+	// tokens are restored over time (50/s * 0.5s = 25)
+	realtime += 0.5;
+	CHECK("Refilled token should be available", !g_DlFileRateLimiter.DlFileIssued(0));
+
+	// every 'new' refreshes the bucket for the next map batch
+	g_DlFileRateLimiter.ClientConnected(0);
+	for (int i = 0; i < 16; i++)
+		CHECK("Reset should restore the bucket", !g_DlFileRateLimiter.DlFileIssued(0));
+	CHECK("Bucket is empty again after the batch", g_DlFileRateLimiter.DlFileIssued(0));
+}

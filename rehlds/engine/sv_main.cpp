@@ -1554,6 +1554,12 @@ void SV_New_f(void)
 #endif
 	host_client->m_sendrescount = 0;
 
+#ifdef REHLDS_FIXES
+	// DoS hardening: refresh the dlfile token bucket, the client is about to
+	// request the resources it is missing on this map (issue #1200).
+	g_DlFileRateLimiter.ClientConnected(host_client - g_psvs.clients);
+#endif
+
 	SZ_Clear(&host_client->netchan.message);
 	SZ_Clear(&host_client->datagram);
 
@@ -8002,7 +8008,12 @@ void SV_BeginFileDownload_f(void)
 	char namebuf[MAX_PATH];
 #endif
 
-	if (Cmd_Argc() < 2 || cmd_source == src_command)
+	if (cmd_source == src_command)
+	{
+		return;
+	}
+
+	if (Cmd_Argc() < 2)
 	{
 		return;
 	}
@@ -8022,6 +8033,28 @@ void SV_BeginFileDownload_f(void)
 	if (!name || !name[0] || (!Q_strncmp(name, szModuleC, 12) && g_psvs.isSecure))
 	{
 		return;
+	}
+
+#ifdef REHLDS_FIXES
+	// DoS hardening: every regular-file dlfile request costs a token from the
+	// client's bucket, duplicates included - deduplication below makes them
+	// cheap to serve, but the parse cost alone is enough to flood the main
+	// thread. A request that arrives with the bucket empty is dropped; a
+	// client that keeps hammering a dropped bucket gets kicked.
+	// Custom logo requests are not counted: they are bounded by the custom.hpk
+	// contents and keep accumulating over the whole session (issue #1200).
+	if (name[0] != '!' && g_DlFileRateLimiter.DlFileIssued(host_client - g_psvs.clients))
+	{
+		return;
+	}
+#endif
+
+	// DoS hardening: drop duplicate download requests before any validation
+	// work - filesystem lookups on every flooded request are what still burns
+	// CPU while a transfer is active (issue #1200).
+	if (Netchan_IsFileTransferActive(&host_client->netchan, name))
+	{
+		return;		// this file is already being transferred
 	}
 
 	if (!IsSafeFileToDownload(name) || sv_allow_download.value == 0.0f)
@@ -8065,8 +8098,10 @@ void SV_BeginFileDownload_f(void)
 #ifdef REHLDS_FIXES
 		if (pbuf && size)
 		{
-			Netchan_CreateFileFragmentsFromBuffer(TRUE, &host_client->netchan, name, pbuf, size);
-			Netchan_FragSend(&host_client->netchan);
+			if (!Netchan_CreateFileFragmentsFromBuffer(TRUE, &host_client->netchan, name, pbuf, size))
+				SV_FailDownload(name);
+			else
+				Netchan_FragSend(&host_client->netchan);
 		}
 		// Mem_Free pbuf even if size is zero
 		if (pbuf)
@@ -8076,8 +8111,10 @@ void SV_BeginFileDownload_f(void)
 #else // REHLDS_FIXES
 		if (pbuf && size)
 		{
-			Netchan_CreateFileFragmentsFromBuffer(TRUE, &host_client->netchan, name, pbuf, size);
-			Netchan_FragSend(&host_client->netchan);
+			if (!Netchan_CreateFileFragmentsFromBuffer(TRUE, &host_client->netchan, name, pbuf, size))
+				SV_FailDownload(name);
+			else
+				Netchan_FragSend(&host_client->netchan);
 			Mem_Free((void *)pbuf);
 		}
 #endif // REHLDS_FIXES
