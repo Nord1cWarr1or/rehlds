@@ -779,6 +779,12 @@ void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd, qboolean fCho
 	trace_t trace;
 	float frametime;
 
+#ifdef REHLDS_FIXES
+	// client could disconnect during CheckLimits or game-DLL callbacks
+	if (!host_client->connected)
+		return;
+#endif // REHLDS_FIXES
+
 	if (host_client->ignorecmdtime > realtime)
 	{
 		host_client->cmdtime = (double)ucmd->msec / 1000.0 + host_client->cmdtime;
@@ -1759,6 +1765,10 @@ void SV_ParseMove(client_t *pSenderClient)
 	}
 
 #ifdef REHLDS_FIXES
+	// skip if client dropped while executing commands
+	if (!host_client->connected)
+		return;
+
 	if (numcmds)
 		host_client->lastcmd = cmds[numcmds - 1];
 	else if (numbackup)

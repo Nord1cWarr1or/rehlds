@@ -84,6 +84,11 @@ private:
 
 #ifdef REHLDS_FIXES
 	double m_localGameTimeBase;
+
+	// Hard deadline (realtime) by which a client inactivated on a level change must re-initiate
+	// its connection, or SV_CheckTimeouts force-drops it. Armed in SV_InactivateClients, cleared
+	// in SV_ConnectClient_internal. 0 = not armed. See sv_reconnect_timeout.
+	double m_reconnectDeadline;
 #endif
 public:
 	CGameClient(int id, client_t* cl);
@@ -271,6 +276,9 @@ public:
 	void SetupLocalGameTime() { m_localGameTimeBase = g_psv.time; }
 	double GetLocalGameTime() const { return g_psv.time - m_localGameTimeBase; }
 	double GetLocalGameTimeBase() const { return m_localGameTimeBase; }
+
+	double GetReconnectDeadline() const { return m_reconnectDeadline; }
+	void SetReconnectDeadline(double time) { m_reconnectDeadline = time; }
 #endif
 };
 

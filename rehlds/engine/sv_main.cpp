@@ -203,6 +203,16 @@ cvar_t sv_newunit = { "sv_newunit", "0", 0, 0.0f, NULL };
 
 cvar_t sv_clienttrace = { "sv_clienttrace", "1", FCVAR_SERVER, 0.0f, NULL };
 cvar_t sv_timeout = { "sv_timeout", "60", 0, 0.0f, NULL };
+#ifdef REHLDS_FIXES
+// Hard deadline (in seconds) for a client to complete a reconnect after a level change.
+// A client that SV_InactivateClients put into the reconnect-pending state but that never
+// re-initiates its connection within this window is force-dropped by SV_CheckTimeouts,
+// independent of the netchan inactivity timeout. This defeats the oxware "svc_stufftext
+// reconnect filter" phantom-slot exploit: the cheat blocks the engine's "reconnect" command
+// on changelevel and keeps the netchan warm, so the normal sv_timeout (which keys off
+// netchan.last_received) never fires and the half-connected slot survives forever. 0 = disabled.
+cvar_t sv_reconnect_timeout = { "sv_reconnect_timeout", "30", 0, 0.0f, NULL };
+#endif // REHLDS_FIXES
 cvar_t sv_failuretime = { "sv_failuretime", "0.5", 0, 0.0f, NULL };
 cvar_t sv_cheats = { "sv_cheats", "0", FCVAR_SERVER, 0.0f, NULL };
 cvar_t sv_password = { "sv_password", "", FCVAR_SERVER | FCVAR_PROTECTED, 0.0f, NULL };
@@ -1544,6 +1554,12 @@ void SV_New_f(void)
 #endif
 	host_client->m_sendrescount = 0;
 
+#ifdef REHLDS_FIXES
+	// DoS hardening: refresh the dlfile token bucket, the client is about to
+	// request the resources it is missing on this map (issue #1200).
+	g_DlFileRateLimiter.ClientConnected(host_client - g_psvs.clients);
+#endif
+
 	SZ_Clear(&host_client->netchan.message);
 	SZ_Clear(&host_client->datagram);
 
@@ -2528,6 +2544,10 @@ void EXT_FUNC SV_ConnectClient_internal(void)
 #ifdef REHLDS_FIXES
 	host_client->m_bSentNewResponse = FALSE;
 	g_GameClients[host_client - g_psvs.clients]->SetSpawnedOnce(false);
+	// Client (re)established its connection, so it obeyed the level-change "reconnect" command.
+	// Disarm the deadline armed by SV_InactivateClients. This happens before any resource
+	// download/spawn, so downloading players are never affected.
+	g_GameClients[host_client - g_psvs.clients]->SetReconnectDeadline(0.0);
 #endif // REHLDS_FIXES
 
 	bIsSecure = Steam_GSBSecure();
@@ -3992,6 +4012,29 @@ void SV_CheckTimeouts(void)
 			continue;
 		if (!cl->connected && !cl->active && !cl->spawned)
 			continue;
+#ifdef REHLDS_FIXES
+		// Force-drop a client that was inactivated on level change but never re-initiated its
+		// connection within sv_reconnect_timeout. This deadline is measured from the inactivation
+		// time (see SV_InactivateClients), NOT from netchan.last_received, so a cheat that keeps
+		// the netchan warm to block the "reconnect" command (oxware svc_stufftext filter ->
+		// phantom slot) cannot dodge it the way it dodges the normal sv_timeout.
+		double reconnectDeadline = g_GameClients[i]->GetReconnectDeadline();
+		if (reconnectDeadline != 0.0)
+		{
+			if (cl->fully_connected)
+			{
+				// Reconnect finished normally; stand down.
+				g_GameClients[i]->SetReconnectDeadline(0.0);
+			}
+			else if (sv_reconnect_timeout.value > 0.0 && (realtime - reconnectDeadline) > sv_reconnect_timeout.value)
+			{
+				Con_DPrintf("Dropping %s: failed to reconnect within %.0fs after level change\n", cl->name, sv_reconnect_timeout.value);
+				g_GameClients[i]->SetReconnectDeadline(0.0);
+				SV_DropClient(cl, FALSE, "Failed to reconnect after level change");
+				continue;
+			}
+		}
+#endif // REHLDS_FIXES
 		if (cl->netchan.last_received < droptime)
 		{
 			SV_BroadcastPrintf("%s timed out\n", cl->name);
@@ -5555,6 +5598,39 @@ void PrecacheMapSpecifiedResources()
 }
 #endif // REHLDS_FIXES
 
+#ifdef REHLDS_FIXES
+// Cleans up one .res line. NULL if it holds no resource.
+char *SV_TrimResourceLine(char *line)
+{
+	while (*line && (uint8_t)*line <= ' ')
+		line++;
+
+	// Comments start at a token boundary, so models//foo.mdl survives
+	for (char *p = line; p[0]; p++)
+	{
+		if (p[0] == '/' && p[1] == '/' && (p == line || (uint8_t)p[-1] <= ' '))
+		{
+			p[0] = '\0';
+			break;
+		}
+	}
+
+	size_t len = Q_strlen(line);
+
+	while (len > 0 && (uint8_t)line[len - 1] <= ' ')
+		len--;
+
+	if (len >= 2 && line[0] == '"' && line[len - 1] == '"')
+	{
+		line++;
+		len -= 2;
+	}
+
+	line[len] = '\0';
+	return len ? line : NULL;
+}
+#endif // REHLDS_FIXES
+
 void SV_CreateGenericResources(void)
 {
 	char filename[MAX_PATH];
@@ -5581,12 +5657,33 @@ void SV_CreateGenericResources(void)
 
 	while (1)
 	{
+#ifdef REHLDS_FIXES
+		// FIXED: .res is line-delimited; COM_Parse shattered spaced paths
+		char *nextData = COM_ParseLine(data);
+		char *resName = SV_TrimResourceLine(com_token);
+
+		if (!resName)
+		{
+			if (!nextData)
+				break;	// end of file
+
+			data = nextData;
+			continue;	// blank line or a comment
+		}
+
+		// Everything below reads com_token
+		if (resName != com_token)
+			Q_memmove(com_token, resName, Q_strlen(resName) + 1);
+
+		// NULL on the last line; the next pass breaks
+		data = nextData;
+
+		char *com_token_extension = Q_strrchr(com_token, '.');
+		bool successful = false;
+#else
 		data = COM_Parse(data);
 		if (Q_strlen(com_token) <= 0)
 			break;
-#ifdef REHLDS_FIXES
-		char *com_token_extension = Q_strrchr(com_token, '.');
-		bool successful = false;
 #endif
 
 		if (Q_strstr(com_token, ".."))
@@ -5640,6 +5737,10 @@ void SV_CreateGenericResources(void)
 		{
 			// In fixed version of PrecacheGeneric we don't need local copy
 #ifdef REHLDS_FIXES
+			// Advertised RES_FATALIFMISSING anyway; may live only on fastdl
+			if (!FS_FileExists(com_token))
+				Con_Printf("WARNING: resource '%s' from '%s' not found!\n", com_token, filename);
+
 			PF_precache_generic_I(com_token);
 			Con_DPrintf("  %s\n", com_token);
 			g_psv.num_generic_names++;
@@ -7719,6 +7820,14 @@ void SV_InactivateClients(void)
 			cl->hasusrmsgs = FALSE;
 			cl->m_bSentNewResponse = FALSE;
 
+#ifdef REHLDS_FIXES
+			// Arm the reconnect deadline: this slot must re-initiate its connection
+			// (SV_ConnectClient clears it) within sv_reconnect_timeout, or SV_CheckTimeouts
+			// force-drops it regardless of netchan activity. Closes the oxware changelevel
+			// phantom-slot exploit, where the cheat blocks "reconnect" and keeps the netchan warm.
+			g_GameClients[i]->SetReconnectDeadline(realtime);
+#endif // REHLDS_FIXES
+
 			SZ_Clear(&cl->netchan.message);
 			SZ_Clear(&cl->datagram);
 
@@ -7861,20 +7970,91 @@ qboolean IsSafeFileToDownload(const char *filename)
 	return TRUE;
 }
 
+#ifdef REHLDS_FIXES
+// Cmd_Argv(1) ends the path at its first space. NULL rejects the request.
+const char *SV_GetRequestedDownloadName(char *out, size_t outSize)
+{
+	const char *args = Cmd_Args();
+
+	// A quoted path is already complete in argv(1)
+	if (!args || !args[0] || args[0] == '"')
+		return Cmd_Argv(1);
+
+	// cmd_args keeps everything past a client-embedded newline
+	size_t len = 0;
+	while (args[len] && args[len] != '\n' && args[len] != '\r')
+	{
+		if (++len >= outSize)
+			return NULL;	// no legitimate resource path is this long
+	}
+
+	while (len > 0 && (uint8_t)args[len - 1] <= ' ')
+		len--;
+
+	if (len == 0)
+		return NULL;
+
+	Q_memcpy(out, args, len);
+	out[len] = '\0';
+	return out;
+}
+#endif // REHLDS_FIXES
+
 void SV_BeginFileDownload_f(void)
 {
 	const char *name;
 	char szModuleC[13] = "!ModuleC.dll";
+#ifdef REHLDS_FIXES
+	char namebuf[MAX_PATH];
+#endif
 
-	if (Cmd_Argc() < 2 || cmd_source == src_command)
+	if (cmd_source == src_command)
 	{
 		return;
 	}
 
+	if (Cmd_Argc() < 2)
+	{
+		return;
+	}
+
+#ifdef REHLDS_FIXES
+	// FIXED: Rebuild resource paths that contain spaces
+	name = SV_GetRequestedDownloadName(namebuf, sizeof(namebuf));
+	if (!name)
+	{
+		SV_FailDownload(Cmd_Argv(1));
+		return;
+	}
+#else
 	name = Cmd_Argv(1);
+#endif
+
 	if (!name || !name[0] || (!Q_strncmp(name, szModuleC, 12) && g_psvs.isSecure))
 	{
 		return;
+	}
+
+#ifdef REHLDS_FIXES
+	// DoS hardening: every regular-file dlfile request costs a token from the
+	// client's bucket, duplicates included - deduplication below makes them
+	// cheap to serve, but the parse cost alone is enough to flood the main
+	// thread. A request that arrives with the bucket empty is dropped; a
+	// client that keeps hammering a dropped bucket gets kicked.
+	// Custom logo requests are not counted: they are bounded by the custom.hpk
+	// contents and keep accumulating over the whole session (issue #1200).
+	if (name[0] != '!' && g_DlFileRateLimiter.DlFileIssued(host_client - g_psvs.clients))
+	{
+		return;
+	}
+#endif
+
+	// DoS hardening: drop duplicate download requests before any validation
+	// work - filesystem lookups on every flooded request are what still burns
+	// CPU while a transfer is active (issue #1200).
+	if (Netchan_IsFileTransferActive(&host_client->netchan, name))
+	{
+		return;		// this file is already being transferred
 	}
 
 	if (!IsSafeFileToDownload(name) || sv_allow_download.value == 0.0f)
@@ -7918,8 +8098,10 @@ void SV_BeginFileDownload_f(void)
 #ifdef REHLDS_FIXES
 		if (pbuf && size)
 		{
-			Netchan_CreateFileFragmentsFromBuffer(TRUE, &host_client->netchan, name, pbuf, size);
-			Netchan_FragSend(&host_client->netchan);
+			if (!Netchan_CreateFileFragmentsFromBuffer(TRUE, &host_client->netchan, name, pbuf, size))
+				SV_FailDownload(name);
+			else
+				Netchan_FragSend(&host_client->netchan);
 		}
 		// Mem_Free pbuf even if size is zero
 		if (pbuf)
@@ -7929,8 +8111,10 @@ void SV_BeginFileDownload_f(void)
 #else // REHLDS_FIXES
 		if (pbuf && size)
 		{
-			Netchan_CreateFileFragmentsFromBuffer(TRUE, &host_client->netchan, name, pbuf, size);
-			Netchan_FragSend(&host_client->netchan);
+			if (!Netchan_CreateFileFragmentsFromBuffer(TRUE, &host_client->netchan, name, pbuf, size))
+				SV_FailDownload(name);
+			else
+				Netchan_FragSend(&host_client->netchan);
 			Mem_Free((void *)pbuf);
 		}
 #endif // REHLDS_FIXES
@@ -8317,6 +8501,9 @@ void SV_Init(void)
 	Cvar_RegisterVariable(&sv_skyvec_y);
 	Cvar_RegisterVariable(&sv_skyvec_z);
 	Cvar_RegisterVariable(&sv_timeout);
+#ifdef REHLDS_FIXES
+	Cvar_RegisterVariable(&sv_reconnect_timeout);
+#endif // REHLDS_FIXES
 	Cvar_RegisterVariable(&sv_clienttrace);
 	Cvar_RegisterVariable(&sv_zmax);
 	Cvar_RegisterVariable(&sv_wateramp);

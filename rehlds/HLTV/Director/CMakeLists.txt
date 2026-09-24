@@ -111,6 +111,8 @@ set(LINK_FLAGS "${LINK_FLAGS} \
 	-Wl,-rpath,'$ORIGIN/.' \
 	-L${PROJECT_SOURCE_DIR}/../../lib/linux32")
 
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,-z,notext")
+
 set_target_properties(director PROPERTIES
 	OUTPUT_NAME director
 	PREFIX ""

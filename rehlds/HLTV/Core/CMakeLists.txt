@@ -136,6 +136,8 @@ if (NOT TARGET bzip2)
 	add_subdirectory(../../../dep/bzip2 lib)
 endif()
 
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,-z,notext")
+
 set_target_properties(core PROPERTIES
 	OUTPUT_NAME core
 	PREFIX ""

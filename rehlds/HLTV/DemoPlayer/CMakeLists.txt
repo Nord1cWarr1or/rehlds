@@ -105,6 +105,8 @@ target_link_libraries(demoplayer PRIVATE
 	m
 )
 
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,-z,notext")
+
 set_target_properties(demoplayer PROPERTIES
 	OUTPUT_NAME demoplayer
 	PREFIX ""

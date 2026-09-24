@@ -190,6 +190,7 @@ set(UNITTESTS_SRCS
 	unittests/common_tests.cpp
 	unittests/crc32c_tests.cpp
 	unittests/delta_tests.cpp
+	unittests/download_tests.cpp
 	unittests/info_tests.cpp
 	unittests/mathlib_tests.cpp
 	unittests/rehlds_tests_shared.cpp
@@ -292,6 +293,8 @@ endif()
 set(LINK_FLAGS "${LINK_FLAGS} \
 	-Wl,-rpath,'$ORIGIN/.' \
 	-L${PROJECT_SOURCE_DIR}/lib/linux32")
+
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,-z,notext")
 
 set_target_properties(engine PROPERTIES
 	OUTPUT_NAME engine_i486

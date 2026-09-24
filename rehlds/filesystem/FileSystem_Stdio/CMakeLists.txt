@@ -99,6 +99,8 @@ target_link_libraries(filesystem_stdio PRIVATE
 	dl
 )
 
+set(LINK_FLAGS "${LINK_FLAGS} -Wl,-z,notext")
+
 set_target_properties(filesystem_stdio PROPERTIES
 	OUTPUT_NAME filesystem_stdio
 	PREFIX ""
