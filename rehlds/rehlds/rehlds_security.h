@@ -69,9 +69,14 @@ public:
 	bool CheckLimits(unsigned int clientId, usercmd_t *ucmd);
 	void ClientConnected(unsigned int clientId);
 
+	// telemetry hooks (debug/movecmdtime-telemetry branch)
+	void OnClockWindowSet(unsigned int clientId, double dif);
+	void OnCmdSkippedByClockWindow(unsigned int clientId);
+
 private:
 
 	double TimeDifference(uint64_t start, uint64_t end) const;
+	void DumpClientState(unsigned int clientId);
 
 	enum TimeAbuseType {
 		ABUSE_NONE = -1,
@@ -95,6 +100,26 @@ private:
 		uint64_t numFrames;
 		unsigned int lastTickTime;
 		unsigned int warnings[ABUSE_MAX];
+
+		// telemetry state (never affects punishment decisions)
+		uint64_t totalMsec;             // all msec accepted by the drift section
+		uint64_t errorBelowSinceMs;     // 0 = error not below -max_error
+		unsigned int telemWarn[ABUSE_MAX]; // every detected abuse event, punish-independent
+		unsigned int ticksDrops;        // cmds dropped by sv_rehlds_movecmd_max_ticks
+		unsigned int nullDrops;         // cmds dropped by sv_rehlds_movecmd_max_null_streak
+		unsigned int interpDrops;       // cmds dropped by sv_rehlds_movecmd_clamp_interp
+		unsigned int abuseDrops[ABUSE_MAX]; // cmds dropped by abuse detection
+		unsigned int dipEvents;         // times ratio fell below min_scale
+		unsigned int dipsNearRollover;  // of those, dips within 10 samples of a window rollover
+		unsigned int cwCount;           // vanilla clockwindow ignore windows set on this client
+		unsigned int cwSkippedCmds;     // cmds skipped during current/last clockwindow window
+		unsigned int cwSkippedTotal;    // total cmds skipped by clockwindow since connect
+		bool cwActive;                  // inside (or just left) a clockwindow ignore window
+		bool inDip;                     // currently inside a ratio dip
+		double nextDumpTime;
+		double lastWarnLogTime;
+		double lastDipLogTime;
+		double lastDropLogTime;
 	};
 
 	usercmd_state_t m_States[MAX_CLIENTS];

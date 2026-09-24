@@ -8236,6 +8236,9 @@ void SV_CheckCmdTimes(void)
 		{
 			cl->ignorecmdtime = clockwindow.value + realtime;
 			cl->cmdtime = realtime - cl->connecttime;
+#ifdef REHLDS_FIXES
+			g_UserCmdTimeLimiter.OnClockWindowSet(cl - g_psvs.clients, dif);
+#endif
 		}
 
 		if (dif < -clockwindow.value)
