@@ -53,7 +53,6 @@ const int MAX_NAME   = 32;
 #include "pm_defs.h"
 #include "inst_baseline.h"
 #include "net_ws.h"
-#include "studio_rehlds.h"
 #include "pm_shared/pm_movevars.h"
 
 const int DEFAULT_SOUND_PACKET_VOLUME			= 255;
@@ -171,13 +170,18 @@ struct rehlds_server_t {
 };
 
 #ifdef REHLDS_FIXES
-typedef struct client_bone_state_s
+// a1batross's bone-unlag concept, reworked: store the animation inputs
+// (not the computed bone matrices) each player had when this snapshot was built.
+// Bones are recomputed from these inputs during lag compensation.
+typedef struct player_anim_state_s
 {
-	bonetransform_t bonetransform;
-	float rotationmatrix[3][4];
-	int numbones;
+	float frame;
+	int sequence;
+	vec3_t angles;
+	unsigned char controller[4];
+	unsigned char blending[2];
 	qboolean valid;
-} client_bone_state_t;
+} player_anim_state_t;
 #endif // REHLDS_FIXES
 
 typedef struct client_frame_s
@@ -188,7 +192,7 @@ typedef struct client_frame_s
 	weapon_data_t weapondata[64];
 	packet_entities_t entities;
 #ifdef REHLDS_FIXES
-	client_bone_state_t bonestate;
+	player_anim_state_t animstate[MAX_CLIENTS];
 #endif
 } client_frame_t;
 

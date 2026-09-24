@@ -48,7 +48,7 @@ typedef struct sv_adjusted_positions_s
 	vec3_t temp_org;
 	int temp_org_setflag;
 #ifdef REHLDS_FIXES
-	client_bone_state_t bonestate;
+	player_anim_state_t animstate;
 #endif
 } sv_adjusted_positions_t;
 
@@ -122,6 +122,5 @@ void SV_SendEnts_f(void);
 void SV_FullUpdate_f(void);
 
 #ifdef REHLDS_FIXES
-void SV_SaveBoneState(client_t *cl, const edict_t *edict);
 void SV_StudioSetupUnlagBones(model_t *pModel, float frame, int sequence, const vec_t *angles, const vec_t *origin, const unsigned char *pcontroller, const unsigned char *pblending, int iBone, const edict_t *edict);
 #endif

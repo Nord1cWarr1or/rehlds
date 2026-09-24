@@ -4909,6 +4909,12 @@ void SV_WriteEntitiesToClient(client_t *client, sizebuf_t *msg)
 
 	packet_entities_t *pack = &frame->entities;
 
+#ifdef REHLDS_FIXES
+	// bone-unlag: reset per-player animation inputs for this snapshot,
+	// players missing from this frame will stay invalid
+	Q_memset(frame->animstate, 0, sizeof(frame->animstate));
+#endif
+
 	// for REHLDS_OPT_PEDANTIC: Allocate the MAX_PACKET_ENTITIES ents in the frame's storage
 	// This allows us to avoid intermediate 'fullpack' storage
 #ifdef REHLDS_OPT_PEDANTIC
@@ -4934,7 +4940,21 @@ void SV_WriteEntitiesToClient(client_t *client, sizebuf_t *msg)
 
 		qboolean add = gEntityInterface.pfnAddToFullPack(&curPack->entities[curPack->num_entities], e, &g_psv.edicts[e], host_client->edict, flags, TRUE, pSet);
 		if (add)
+		{
+#ifdef REHLDS_FIXES
+			// bone-unlag: capture the animation inputs of this player
+			// at the same moment the entity state (position) is captured
+			edict_t *pent = &g_psv.edicts[e];
+			player_anim_state_t *anim = &frame->animstate[e - 1];
+			anim->frame = pent->v.frame;
+			anim->sequence = pent->v.sequence;
+			VectorCopy(pent->v.angles, anim->angles);
+			Q_memcpy(anim->controller, pent->v.controller, sizeof(anim->controller));
+			Q_memcpy(anim->blending, pent->v.blending, sizeof(anim->blending));
+			anim->valid = TRUE;
+#endif
 			++curPack->num_entities;
+		}
 	}
 
 	for (; e < g_psv.num_edicts; e++)
