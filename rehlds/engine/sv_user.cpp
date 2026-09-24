@@ -785,6 +785,12 @@ void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd, qboolean fCho
 	if (host_client->ignorecmdtime > realtime)
 	{
 		host_client->cmdtime = (double)ucmd->msec / 1000.0 + host_client->cmdtime;
+#ifdef REHLDS_FIXES
+		// telemetry: this command is skipped by the vanilla clockwindow
+		// mechanism BEFORE CUserCmdTimeLimiter::CheckLimits sees it, so its
+		// msec never reaches the drift detector
+		g_UserCmdTimeLimiter.OnCmdSkippedByClockWindow(host_client - g_psvs.clients);
+#endif
 		return;
 	}
 

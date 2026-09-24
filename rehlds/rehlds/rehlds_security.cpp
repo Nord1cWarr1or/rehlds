@@ -1,5 +1,9 @@
 #include "precompiled.h"
 
+#include <stdio.h>
+#include <stdarg.h>
+#include <time.h>
+
 cvar_t sv_rehlds_movecmdrate_max_avg = { "sv_rehlds_movecmdrate_max_avg", "1800", 0, 1800.0f, NULL };
 cvar_t sv_rehlds_movecmdrate_max_burst = { "sv_rehlds_movecmdrate_max_burst", "5500", 0, 5500.0f, NULL };
 cvar_t sv_rehlds_stringcmdrate_max_avg = { "sv_rehlds_stringcmdrate_max_avg", "250", 0, 250.0f, NULL };
@@ -31,10 +35,50 @@ cvar_t sv_rehlds_movecmdtime_max_scale = { "sv_rehlds_movecmdtime_max_scale", "3
 cvar_t sv_rehlds_movecmdtime_min_scale = { "sv_rehlds_movecmdtime_min_scale", "0.5", 0, 0.5f, NULL };
 cvar_t sv_rehlds_movecmdtime_punish = { "sv_rehlds_movecmdtime_punish", "-1", 0, -1.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_max_warnings = { "sv_rehlds_movecmdtime_max_warnings", "-1", 0, -1.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_debug = { "sv_rehlds_movecmdtime_debug", "0", 0, 0.0f, NULL };
 
 CMoveCommandRateLimiter g_MoveCommandRateLimiter;
 CStringCommandsRateLimiter g_StringCommandsRateLimiter;
 CUserCmdTimeLimiter g_UserCmdTimeLimiter;
+
+// movecmdtime telemetry: appends one line per event/state dump to
+// logs/movecmdtime_debug.log (falls back to the server dir, then to console).
+// Enabled by sv_rehlds_movecmdtime_debug; collects data even when punishment
+// (sv_rehlds_movecmdtime_max_warnings) is disabled.
+static FILE *g_pMoveCmdTimeLog = NULL;
+
+static void MCmd_Log(const char *fmt, ...)
+{
+	char line[1024];
+	char stamp[32];
+	time_t t;
+	va_list args;
+
+	if (sv_rehlds_movecmdtime_debug.value < 1.0f) {
+		return;
+	}
+
+	if (!g_pMoveCmdTimeLog) {
+		g_pMoveCmdTimeLog = fopen("logs/movecmdtime_debug.log", "a");
+		if (!g_pMoveCmdTimeLog) {
+			g_pMoveCmdTimeLog = fopen("movecmdtime_debug.log", "a");
+		}
+	}
+
+	t = time(NULL);
+	strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", localtime(&t));
+
+	va_start(args, fmt);
+	vsnprintf(line, sizeof(line), fmt, args);
+	va_end(args);
+
+	if (g_pMoveCmdTimeLog) {
+		fprintf(g_pMoveCmdTimeLog, "[%s rt=%.3f] %s\n", stamp, realtime, line);
+		fflush(g_pMoveCmdTimeLog);
+	} else {
+		Con_Printf("[mcmd %s rt=%.3f] %s\n", stamp, realtime, line);
+	}
+}
 CDlFileRateLimiter g_DlFileRateLimiter;
 
 CMoveCommandRateLimiter::CMoveCommandRateLimiter() {
@@ -308,6 +352,13 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	if (sv_rehlds_movecmd_max_ticks.value > 0)
 	{
 		if (ust->ticksThisFrame >= (unsigned int)sv_rehlds_movecmd_max_ticks.value) {
+			ust->ticksDrops++;
+			if (sv_rehlds_movecmdtime_debug.value >= 2.0f && realtime - ust->lastDropLogTime >= 5.0) {
+				ust->lastDropLogTime = realtime;
+				// dropped BEFORE the drift section: wall time advances, msecTime does not
+				MCmd_Log("DROP-TICKS name=%s total=%u limit=%u (cmd dropped, not counted in client clock)",
+					cl->name, ust->ticksDrops, (unsigned int)sv_rehlds_movecmd_max_ticks.value);
+			}
 			return true;
 		}
 
@@ -322,6 +373,12 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		if (ucmd->msec == 0)
 		{
 			if (++ust->consecutiveNullCmds > (unsigned int)sv_rehlds_movecmd_max_null_streak.value) {
+				ust->nullDrops++;
+				if (sv_rehlds_movecmdtime_debug.value >= 2.0f && realtime - ust->lastDropLogTime >= 5.0) {
+					ust->lastDropLogTime = realtime;
+					MCmd_Log("DROP-NULL name=%s total=%u streak=%u (cmd dropped, not counted in client clock)",
+						cl->name, ust->nullDrops, ust->consecutiveNullCmds);
+				}
 				return true; // streak exceeded, drop command
 			}
 		}
@@ -335,6 +392,12 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	if (sv_rehlds_movecmd_clamp_interp.value > 0) {
 		int maxexinterp = cl->proxy ? (MAX_EX_INTERP_SPECTATOR * 1000.0f) : (MAX_EX_INTERP * 1000.0f);
 		if (ucmd->lerp_msec < 0 || ucmd->lerp_msec > maxexinterp) {
+			ust->interpDrops++;
+			if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastDropLogTime >= 5.0) {
+				ust->lastDropLogTime = realtime;
+				MCmd_Log("DROP-INTERP name=%s total=%u lerp_msec=%d limit=%d (cmd dropped, not counted in client clock)",
+					cl->name, ust->interpDrops, (int)ucmd->lerp_msec, maxexinterp);
+			}
 			return true;
 		}
 	}
@@ -349,12 +412,31 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	uint64_t now = (uint64_t)(realtime * 1000.0);
 
+	// telemetry: first analyzed command after a clockwindow ignore window.
+	// Vanilla SV_CheckCmdTimes skipped every command in the window (before
+	// CheckLimits ever saw them), so the wall time of the window is missing
+	// from msecTime and shows up here as a sudden negative error jump.
+	if (ust->cwActive)
+	{
+		ust->cwActive = false;
+		uint64_t cwGapMs = (ust->lastUpdateTime != 0 && now > ust->lastUpdateTime) ? (now - ust->lastUpdateTime) : 0;
+		double cwErr = (ust->msecTime != 0) ? ((double)ust->msecTime - (double)now) : 0.0;
+		if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+			MCmd_Log("CW-RESUME name=%s gap=%llums skipped=%u errorNow=%+.0fms (clockwindow ignore ended, detector clock was NOT rebased)",
+				cl->name, (unsigned long long)cwGapMs, ust->cwSkippedCmds, cwErr);
+		}
+		ust->cwSkippedCmds = 0;
+	}
+
 	// Initialize states for newly active clients
 	if (ust->msecTime == 0) ust->msecTime = now;
 	if (ust->joinTime == 0) ust->joinTime = now;
 	if (ust->lastUpdateTime == 0) ust->lastUpdateTime = now;
 
 	ust->msecTime += ucmd->msec;
+	ust->totalMsec += ucmd->msec;
+
+	uint64_t curGapMs = (now > ust->lastUpdateTime) ? (now - ust->lastUpdateTime) : 0;
 
 	if (ust->numFrames < (uint64_t)sv_rehlds_movecmdtime_samples.value) {
 		ust->avgMsec += ucmd->msec;
@@ -381,6 +463,33 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	// abnormal time acceleration (speedhack)
 	float maxError = sv_rehlds_movecmdtime_max_error.value;
+
+	// telemetry: track time spent continuously below -max_error ("dead band":
+	// between -max_error and -2*max_error msecTime is never rebased, so a
+	// single lag/clockwindow episode keeps the client primed for warnings)
+	if (error < -maxError)
+	{
+		if (ust->errorBelowSinceMs == 0)
+		{
+			ust->errorBelowSinceMs = now;
+			if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+				double perM = (ust->numFrames > 0) ? (ust->avgMsec / (double)ust->numFrames) : ust->avgMsec;
+				MCmd_Log("DEFICIT-ENTER name=%s error=%+.0fms ratio=%.2f avgMsec=%.1f fps~%.0f loss=%u cw=%u interpDrops=%u tickDrops=%u",
+					cl->name, error, timescale_ratio, perM,
+					(perM > 0.0) ? (1000.0 / perM) : 0.0,
+					(unsigned int)cl->packet_loss, ust->cwCount, ust->interpDrops, ust->ticksDrops);
+			}
+		}
+	}
+	else if (ust->errorBelowSinceMs != 0 && error > -maxError * 0.5)
+	{
+		if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+			MCmd_Log("DEFICIT-EXIT name=%s belowFor=%.1fs error=%+.0fms",
+				cl->name, (double)(now - ust->errorBelowSinceMs) / 1000.0, error);
+		}
+		ust->errorBelowSinceMs = 0;
+	}
+
 	if (error > maxError)
 	{
 		if (timescale_ratio > sv_rehlds_movecmdtime_max_scale.value) {
@@ -391,6 +500,10 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	else if (error < -maxError)
 	{
 		if (error < -(maxError * 2.0f)) {
+			if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+				MCmd_Log("DEEP-RESET name=%s error=%+.0fms (msecTime rebased to now)",
+					cl->name, error);
+			}
 			ust->msecTime = now;
 		}
 
@@ -399,10 +512,59 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		}
 	}
 
+	// telemetry: ratio dip episodes, independent of the deficit zone.
+	// A dip WITHOUT deficit is harmless by design (no warning can fire);
+	// counting where dips happen tells us if they are rollover artifacts.
+	if (ust->avgServerTime > 0.0f && timescale_ratio < sv_rehlds_movecmdtime_min_scale.value)
+	{
+		if (!ust->inDip)
+		{
+			ust->inDip = true;
+			ust->dipEvents++;
+			bool nearRollover = ust->numFrames <= 10;
+			if (nearRollover) {
+				ust->dipsNearRollover++;
+			}
+			if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastDipLogTime >= 2.0) {
+				ust->lastDipLogTime = realtime;
+				MCmd_Log("DIP name=%s ratio=%.2f win=%llu/%d nearRollover=%d gap=%llums avgMsec=%.1f avgSrv=%.1f error=%+.0fms loss=%u",
+					cl->name, timescale_ratio,
+					(unsigned long long)ust->numFrames, (int)sv_rehlds_movecmdtime_samples.value,
+					nearRollover ? 1 : 0,
+					(unsigned long long)curGapMs, ust->avgMsec, ust->avgServerTime, error,
+					(unsigned int)cl->packet_loss);
+			}
+		}
+	}
+	else
+	{
+		ust->inDip = false;
+	}
+
 	if (abuseType != ABUSE_NONE)
 	{
 		// revert accumulated time
 		ust->msecTime -= ucmd->msec;
+
+		// telemetry: counts every detected abuse event even when punishment
+		// is disabled (sv_rehlds_movecmdtime_max_warnings < 0)
+		ust->abuseDrops[(int)abuseType]++;
+		ust->telemWarn[(int)abuseType]++;
+
+		if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastWarnLogTime >= 2.0)
+		{
+			ust->lastWarnLogTime = realtime;
+			MCmd_Log("WARN name=%s type=%s total=%u error=%+.0fms ratio=%.2f win=%llu/%d avgMsec=%.1f avgSrv=%.1f belowFor=%.0fs loss=%u cw=%u drops(t=%u n=%u i=%u)",
+				cl->name,
+				(abuseType == ABUSE_SPEEDHACK) ? "speedhack" : "slowmo",
+				ust->telemWarn[(int)abuseType],
+				error, timescale_ratio,
+				(unsigned long long)ust->numFrames, (int)sv_rehlds_movecmdtime_samples.value,
+				ust->avgMsec, ust->avgServerTime,
+				(ust->errorBelowSinceMs != 0 && now > ust->errorBelowSinceMs) ? ((double)(now - ust->errorBelowSinceMs) / 1000.0) : 0.0,
+				(unsigned int)cl->packet_loss,
+				ust->cwCount, ust->ticksDrops, ust->nullDrops, ust->interpDrops);
+		}
 
 		if (sv_rehlds_movecmdtime_max_warnings.value >= 0.0f)
 		{
@@ -425,6 +587,13 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 					Cbuf_AddText(va("addip %.1f %s\n", sv_rehlds_movecmdtime_punish.value, NET_BaseAdrToString(cl->netchan.remote_address)));
 					SV_DropClient(cl, FALSE, va("Banned for %s", punishReason));
+				}
+
+				if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+					MCmd_Log("PUNISH name=%s type=%s warnCount=%u telemWarn=%u error=%+.0fms ratio=%.2f belowFor=%.0fs",
+						cl->name, punishReason, ust->warnings[(int)abuseType], ust->telemWarn[(int)abuseType],
+						error, timescale_ratio,
+						(ust->errorBelowSinceMs != 0 && now > ust->errorBelowSinceMs) ? ((double)(now - ust->errorBelowSinceMs) / 1000.0) : 0.0);
 				}
 			}
 		}
@@ -463,6 +632,81 @@ void CUserCmdTimeLimiter::Frame()
 	for (unsigned int i = 0; i < MAX_CLIENTS; i++) {
 		m_States[i].ticksThisFrame = 0;
 	}
+
+	if (sv_rehlds_movecmdtime_debug.value < 1.0f) {
+		return;
+	}
+
+	// periodic per-client state dump, one line every 10 seconds
+	for (unsigned int i = 0; i < MAX_CLIENTS; i++)
+	{
+		client_t *cl = &g_psvs.clients[i];
+		if (!cl->connected || cl->fakeclient) {
+			continue;
+		}
+
+		if (realtime < m_States[i].nextDumpTime) {
+			continue;
+		}
+
+		m_States[i].nextDumpTime = realtime + 10.0;
+		DumpClientState(i);
+	}
+}
+
+void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
+{
+	client_t *cl = &g_psvs.clients[clientId];
+	usercmd_state_t *ust = &m_States[clientId];
+	uint64_t now = (uint64_t)(realtime * 1000.0);
+
+	double error = (ust->msecTime != 0) ? ((double)ust->msecTime - (double)now) : 0.0;
+	uint64_t elapsedMs = (ust->joinTime != 0 && now > ust->joinTime) ? (now - ust->joinTime) : 0;
+	double clockRate = (elapsedMs > 0) ? ((double)ust->totalMsec / (double)elapsedMs) : 0.0;
+	double perM = (ust->numFrames > 0) ? (ust->avgMsec / (double)ust->numFrames) : ust->avgMsec;
+	double ratio = (ust->avgMsec != 0.0f && ust->avgServerTime != 0.0f) ? (ust->avgMsec / ust->avgServerTime) : 0.0;
+
+	// clockRate: client msec accepted per server ms since connect. ~1.0 for a
+	// healthy client; well below 1.0 = systematic under-report (loss, msec
+	// truncation at high fps, clockwindow skips, dropped cmds).
+	MCmd_Log("STATE name=%s err=%+.0fms belowFor=%.0fs clockRate=%.2f ratio=%.2f perMsec=%.1f perSrv=%.1f win=%llu/%d fps~%.0f loss=%u twarn=(s:%u m:%u) dips=%u(near:%u) drops=(t:%u n:%u i:%u a:%u/%u) cw=%u skipped=%u msec=%llums age=%.0fs",
+		cl->name,
+		error,
+		(ust->errorBelowSinceMs != 0 && now > ust->errorBelowSinceMs) ? ((double)(now - ust->errorBelowSinceMs) / 1000.0) : 0.0,
+		clockRate, ratio, perM, ust->avgServerTime,
+		(unsigned long long)ust->numFrames, (int)sv_rehlds_movecmdtime_samples.value,
+		(perM > 0.0) ? (1000.0 / perM) : 0.0,
+		(unsigned int)cl->packet_loss,
+		ust->telemWarn[ABUSE_SPEEDHACK], ust->telemWarn[ABUSE_SLOWMO],
+		ust->dipEvents, ust->dipsNearRollover,
+		ust->ticksDrops, ust->nullDrops, ust->interpDrops,
+		ust->abuseDrops[ABUSE_SPEEDHACK], ust->abuseDrops[ABUSE_SLOWMO],
+		ust->cwCount, ust->cwSkippedTotal,
+		(unsigned long long)ust->totalMsec,
+		elapsedMs / 1000.0);
+}
+
+void CUserCmdTimeLimiter::OnClockWindowSet(unsigned int clientId, double dif)
+{
+	client_t *cl = &g_psvs.clients[clientId];
+	usercmd_state_t *ust = &m_States[clientId];
+
+	ust->cwCount++;
+	ust->cwActive = true;
+
+	if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+		MCmd_Log("CW-SET name=%s drift=%+.3fs window=%.2fs total=%u (vanilla clockwindow will ignore cmds, detector clock not counted during it)",
+			cl->name, dif, clockwindow.value, ust->cwCount);
+	}
+}
+
+void CUserCmdTimeLimiter::OnCmdSkippedByClockWindow(unsigned int clientId)
+{
+	usercmd_state_t *ust = &m_States[clientId];
+
+	ust->cwActive = true;
+	ust->cwSkippedCmds++;
+	ust->cwSkippedTotal++;
 }
 
 void Rehlds_Security_Init() {
@@ -490,6 +734,7 @@ void Rehlds_Security_Init() {
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_min_scale);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_punish);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_max_warnings);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_debug);
 #endif
 }
 
