@@ -116,6 +116,8 @@ private:
 		unsigned int cwSkippedTotal;    // total cmds skipped by clockwindow since connect
 		bool cwActive;                  // inside (or just left) a clockwindow ignore window
 		bool inDip;                     // currently inside a ratio dip
+		unsigned int gapResets;         // measurement restarts after long client silence
+		unsigned int noWarnResets;      // deep-error clock rebases that skipped detection
 		double nextDumpTime;
 		double lastWarnLogTime;
 		double lastDipLogTime;
