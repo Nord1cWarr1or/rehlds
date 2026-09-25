@@ -36,6 +36,8 @@ cvar_t sv_rehlds_movecmdtime_min_scale = { "sv_rehlds_movecmdtime_min_scale", "0
 cvar_t sv_rehlds_movecmdtime_punish = { "sv_rehlds_movecmdtime_punish", "-1", 0, -1.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_max_warnings = { "sv_rehlds_movecmdtime_max_warnings", "-1", 0, -1.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_debug = { "sv_rehlds_movecmdtime_debug", "0", 0, 0.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_gap_reset = { "sv_rehlds_movecmdtime_gap_reset", "0.5", 0, 0.5f, NULL };
+cvar_t sv_rehlds_movecmdtime_recover_rate = { "sv_rehlds_movecmdtime_recover_rate", "25", 0, 25.0f, NULL };
 
 CMoveCommandRateLimiter g_MoveCommandRateLimiter;
 CStringCommandsRateLimiter g_StringCommandsRateLimiter;
@@ -348,11 +350,17 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	usercmd_state_t *ust = &m_States[clientId];
 
+	uint64_t now = (uint64_t)(realtime * 1000.0);
+
 	// check move command flood within a single server tick
 	if (sv_rehlds_movecmd_max_ticks.value > 0)
 	{
 		if (ust->ticksThisFrame >= (unsigned int)sv_rehlds_movecmd_max_ticks.value) {
 			ust->ticksDrops++;
+			// drop period must not crater the ratio window of the next
+			// accepted command; the msec deficit it creates is healed by
+			// the bounded clock recovery instead
+			ust->lastUpdateTime = now;
 			if (sv_rehlds_movecmdtime_debug.value >= 2.0f && realtime - ust->lastDropLogTime >= 5.0) {
 				ust->lastDropLogTime = realtime;
 				// dropped BEFORE the drift section: wall time advances, msecTime does not
@@ -374,6 +382,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		{
 			if (++ust->consecutiveNullCmds > (unsigned int)sv_rehlds_movecmd_max_null_streak.value) {
 				ust->nullDrops++;
+				ust->lastUpdateTime = now;
 				if (sv_rehlds_movecmdtime_debug.value >= 2.0f && realtime - ust->lastDropLogTime >= 5.0) {
 					ust->lastDropLogTime = realtime;
 					MCmd_Log("DROP-NULL name=%s total=%u streak=%u (cmd dropped, not counted in client clock)",
@@ -393,6 +402,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		int maxexinterp = cl->proxy ? (MAX_EX_INTERP_SPECTATOR * 1000.0f) : (MAX_EX_INTERP * 1000.0f);
 		if (ucmd->lerp_msec < 0 || ucmd->lerp_msec > maxexinterp) {
 			ust->interpDrops++;
+			ust->lastUpdateTime = now;
 			if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastDropLogTime >= 5.0) {
 				ust->lastDropLogTime = realtime;
 				MCmd_Log("DROP-INTERP name=%s total=%u lerp_msec=%d limit=%d (cmd dropped, not counted in client clock)",
@@ -410,8 +420,6 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		return false;
 	}
 
-	uint64_t now = (uint64_t)(realtime * 1000.0);
-
 	// telemetry: first analyzed command after a clockwindow ignore window.
 	// Vanilla SV_CheckCmdTimes skipped every command in the window (before
 	// CheckLimits ever saw them), so the wall time of the window is missing
@@ -426,6 +434,27 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 				cl->name, (unsigned long long)cwGapMs, ust->cwSkippedCmds, cwErr);
 		}
 		ust->cwSkippedCmds = 0;
+	}
+
+	// Fix: a long silence (AFK, minimized client, level load, server stall)
+	// is not slowmo evidence - restart all measurements from this command.
+	// The command itself still runs normally.
+	uint64_t gapMs = (ust->lastUpdateTime != 0 && now > ust->lastUpdateTime) ? (now - ust->lastUpdateTime) : 0;
+	if (sv_rehlds_movecmdtime_gap_reset.value > 0.0f &&
+		gapMs > (uint64_t)(sv_rehlds_movecmdtime_gap_reset.value * 1000.0f))
+	{
+		ust->msecTime = now;
+		ust->lastUpdateTime = now;
+		ust->avgMsec = 0.0;
+		ust->avgServerTime = 0.0;
+		ust->numFrames = 0;
+		ust->errorBelowSinceMs = 0;
+		ust->inDip = false;
+		ust->gapResets++;
+		if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+			MCmd_Log("GAP-RESET name=%s gap=%llums (measurements restarted)",
+				cl->name, (unsigned long long)gapMs);
+		}
 	}
 
 	// Initialize states for newly active clients
@@ -464,6 +493,31 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// abnormal time acceleration (speedhack)
 	float maxError = sv_rehlds_movecmdtime_max_error.value;
 
+	// detection is only allowed on a filled window: on a fresh/recently
+	// normalized window the ratio is meaningless (rollover artifact,
+	// replay-burst spikes)
+	bool windowReady = ust->numFrames >= (uint64_t)(sv_rehlds_movecmdtime_samples.value * 0.25f);
+
+	// Fix: deep deficit means the SERVER failed to process commands (stall,
+	// map change, mass lag) - the clock is rebased and detection is skipped
+	// entirely. Punishing here hit every innocent client at once.
+	if (error < -(maxError * 2.0f))
+	{
+		ust->msecTime = now;
+		ust->lastUpdateTime = now;
+		ust->avgMsec = 0.0;
+		ust->avgServerTime = 0.0;
+		ust->numFrames = 0;
+		ust->errorBelowSinceMs = 0;
+		ust->inDip = false;
+		ust->noWarnResets++;
+		if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+			MCmd_Log("RESET-DROP name=%s error=%+.0fms (clock rebased, detection skipped)",
+				cl->name, error);
+		}
+		return true;
+	}
+
 	// telemetry: track time spent continuously below -max_error ("dead band":
 	// between -max_error and -2*max_error msecTime is never rebased, so a
 	// single lag/clockwindow episode keeps the client primed for warnings)
@@ -492,22 +546,14 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	if (error > maxError)
 	{
-		if (timescale_ratio > sv_rehlds_movecmdtime_max_scale.value) {
+		if (windowReady && timescale_ratio > sv_rehlds_movecmdtime_max_scale.value) {
 			abuseType = ABUSE_SPEEDHACK;
 		}
 	}
-	// abnormal time deceleration (slow-mo) or overcharging
+	// abnormal time deceleration (slow-mo)
 	else if (error < -maxError)
 	{
-		if (error < -(maxError * 2.0f)) {
-			if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
-				MCmd_Log("DEEP-RESET name=%s error=%+.0fms (msecTime rebased to now)",
-					cl->name, error);
-			}
-			ust->msecTime = now;
-		}
-
-		if (timescale_ratio < sv_rehlds_movecmdtime_min_scale.value) {
+		if (windowReady && timescale_ratio < sv_rehlds_movecmdtime_min_scale.value) {
 			abuseType = ABUSE_SLOWMO;
 		}
 	}
@@ -515,7 +561,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// telemetry: ratio dip episodes, independent of the deficit zone.
 	// A dip WITHOUT deficit is harmless by design (no warning can fire);
 	// counting where dips happen tells us if they are rollover artifacts.
-	if (ust->avgServerTime > 0.0f && timescale_ratio < sv_rehlds_movecmdtime_min_scale.value)
+	if (windowReady && ust->avgServerTime > 0.0f && timescale_ratio < sv_rehlds_movecmdtime_min_scale.value)
 	{
 		if (!ust->inDip)
 		{
@@ -622,6 +668,25 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		{
 			ust->accMsecStable = 0;
 		}
+
+		// Fix: bounded clock recovery - heal a leftover clock deficit/gain at
+		// a limited rate so a single lag episode clears in seconds, while
+		// systematic slowmo/speedhack pressure (far above the recovery rate)
+		// keeps error pinned past the threshold and stays detectable
+		if (sv_rehlds_movecmdtime_recover_rate.value > 0.0f && curGapMs > 0)
+		{
+			double heal = (double)sv_rehlds_movecmdtime_recover_rate.value * (curGapMs / 1000.0);
+			if (error < 0.0)
+			{
+				uint64_t step = (uint64_t)((-error < heal) ? -error : heal);
+				ust->msecTime += step;
+			}
+			else if (error > 0.0)
+			{
+				uint64_t step = (uint64_t)((error < heal) ? error : heal);
+				ust->msecTime -= step;
+			}
+		}
 	}
 
 	return false;
@@ -669,7 +734,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 	// clockRate: client msec accepted per server ms since connect. ~1.0 for a
 	// healthy client; well below 1.0 = systematic under-report (loss, msec
 	// truncation at high fps, clockwindow skips, dropped cmds).
-	MCmd_Log("STATE name=%s err=%+.0fms belowFor=%.0fs clockRate=%.2f ratio=%.2f perMsec=%.1f perSrv=%.1f win=%llu/%d fps~%.0f loss=%u twarn=(s:%u m:%u) dips=%u(near:%u) drops=(t:%u n:%u i:%u a:%u/%u) cw=%u skipped=%u msec=%llums age=%.0fs",
+	MCmd_Log("STATE name=%s err=%+.0fms belowFor=%.0fs clockRate=%.2f ratio=%.2f perMsec=%.1f perSrv=%.1f win=%llu/%d fps~%.0f loss=%u twarn=(s:%u m:%u) dips=%u(near:%u) drops=(t:%u n:%u i:%u a:%u/%u) cw=%u skipped=%u gapR=%u noWarnR=%u msec=%llums age=%.0fs",
 		cl->name,
 		error,
 		(ust->errorBelowSinceMs != 0 && now > ust->errorBelowSinceMs) ? ((double)(now - ust->errorBelowSinceMs) / 1000.0) : 0.0,
@@ -682,6 +747,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		ust->ticksDrops, ust->nullDrops, ust->interpDrops,
 		ust->abuseDrops[ABUSE_SPEEDHACK], ust->abuseDrops[ABUSE_SLOWMO],
 		ust->cwCount, ust->cwSkippedTotal,
+		ust->gapResets, ust->noWarnResets,
 		(unsigned long long)ust->totalMsec,
 		elapsedMs / 1000.0);
 }
@@ -735,6 +801,8 @@ void Rehlds_Security_Init() {
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_punish);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_max_warnings);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_debug);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_gap_reset);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_recover_rate);
 #endif
 }
 
