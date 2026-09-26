@@ -5027,11 +5027,30 @@ void SV_WriteEntitiesToClient(client_t *client, sizebuf_t *msg)
 
 	// Record per-player duck state alongside the packed origins (used by the unlag hull rewind)
 	Q_memset(frame->usehull, 0, sizeof(frame->usehull));
+#ifdef REHLDS_FIXES
+	// bone-unlag: reset per-player animation inputs for this snapshot,
+	// players missing from this frame will stay invalid
+	Q_memset(frame->animstate, 0, sizeof(frame->animstate));
+#endif
 	for (int i = 0; i < pack->num_entities; i++)
 	{
 		int number = pack->entities[i].number;
 		if (number > 0 && number <= g_psvs.maxclients)
+		{
 			frame->usehull[number] = (g_psv.edicts[number].v.flags & FL_DUCKING) ? 1 : 0;
+#ifdef REHLDS_FIXES
+			// bone-unlag: capture the animation inputs of this player
+			// alongside the packed position
+			edict_t *pent = &g_psv.edicts[number];
+			player_anim_state_t *anim = &frame->animstate[number - 1];
+			anim->frame = pent->v.frame;
+			anim->sequence = pent->v.sequence;
+			VectorCopy(pent->v.angles, anim->angles);
+			Q_memcpy(anim->controller, pent->v.controller, sizeof(anim->controller));
+			Q_memcpy(anim->blending, pent->v.blending, sizeof(anim->blending));
+			anim->valid = TRUE;
+#endif
+		}
 	}
 
 	SV_EmitPacketEntities(client, pack, msg);
@@ -8465,6 +8484,9 @@ void SV_Init(void)
 	Cvar_RegisterVariable(&sv_instancedbaseline);
 	Cvar_RegisterVariable(&sv_contact);
 	Cvar_RegisterVariable(&sv_unlag);
+#ifdef REHLDS_FIXES
+	Cvar_RegisterVariable(&sv_bone_unlag);
+#endif
 	Cvar_RegisterVariable(&sv_maxunlag);
 	Cvar_RegisterVariable(&sv_unlagpush);
 	Cvar_RegisterVariable(&sv_unlagsamples);

@@ -169,6 +169,21 @@ struct rehlds_server_t {
 #endif
 };
 
+#ifdef REHLDS_FIXES
+// a1batross's bone-unlag concept, reworked: store the animation inputs
+// (not the computed bone matrices) each player had when this snapshot was built.
+// Bones are recomputed from these inputs during lag compensation.
+typedef struct player_anim_state_s
+{
+	float frame;
+	int sequence;
+	vec3_t angles;
+	unsigned char controller[4];
+	unsigned char blending[2];
+	qboolean valid;
+} player_anim_state_t;
+#endif // REHLDS_FIXES
+
 typedef struct client_frame_s
 {
 	double senttime;
@@ -177,6 +192,9 @@ typedef struct client_frame_s
 	weapon_data_t weapondata[64];
 	packet_entities_t entities;
 	byte usehull[MAX_CLIENTS + 1]; // per-player duck state at frame time (entity-number indexed, used by the unlag hull rewind)
+#ifdef REHLDS_FIXES
+	player_anim_state_t animstate[MAX_CLIENTS];
+#endif
 } client_frame_t;
 
 typedef struct client_s

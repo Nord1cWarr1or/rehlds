@@ -54,6 +54,9 @@ cvar_t sv_footsteps = { "mp_footsteps", "1", FCVAR_SERVER, 0.0f, NULL };
 cvar_t sv_rollspeed = { "sv_rollspeed", "0.0", 0, 0.0f, NULL };
 cvar_t sv_rollangle = { "sv_rollangle", "0.0", 0, 0.0f, NULL };
 cvar_t sv_unlag = { "sv_unlag", "1", 0, 0.0f, NULL };
+#ifdef REHLDS_FIXES
+cvar_t sv_bone_unlag = { "sv_bone_unlag", "0", 0, 0.0f, NULL };
+#endif
 cvar_t sv_maxunlag = { "sv_maxunlag", "0.5", 0, 0.0f, NULL };
 cvar_t sv_unlagpush = { "sv_unlagpush", "0.0", 0, 0.0f, NULL };
 cvar_t sv_unlagsamples = { "sv_unlagsamples", "1", 0, 0.0f, NULL };
@@ -1538,6 +1541,14 @@ void SV_SetupMove(client_t *_host_client)
 
 		pnextstate = SV_FindEntInPack(state->number, &frame->entities);
 
+#ifdef REHLDS_FIXES
+		// Take the animation inputs from the same snapshot the position
+		// interpolation comes from. No interpolation of animation state:
+		// snapping to nextFrame is at most one snapshot stale and avoids
+		// angle-wrap and sequence-change artifacts.
+		pos->animstate = nextFrame->animstate[state->number - 1];
+#endif
+
 		if (pnextstate)
 		{
 			delta[0] = pnextstate->origin[0] - state->origin[0];
@@ -1625,6 +1636,10 @@ void SV_RestoreMove(client_t *_host_client)
 			pos->hullswapped = 0;
 			SV_LinkEdict(cli->edict, FALSE);
 		}
+
+#ifdef REHLDS_FIXES
+		pos->animstate.valid = false;
+#endif
 
 		if (VectorCompare(pos->initial_correction_org, cli->edict->v.origin))
 		{
@@ -2169,3 +2184,57 @@ void SV_FullUpdate_f(void)
 	gEntityInterface.pfnClientCommand(sv_player);
 #endif // REHLDS_FIXES
 }
+
+#ifdef REHLDS_FIXES
+qboolean SV_InStudioUnlagRewind(const edict_t *edict)
+{
+	if (!edict || sv_bone_unlag.value == 0.0f || nofind != 0)
+		return FALSE;
+
+	if (!(edict->v.flags & FL_CLIENT))
+		return FALSE;
+
+	int num = NUM_FOR_EDICT(edict) - 1;
+	if (num < 0 || num >= MAX_CLIENTS)
+		return FALSE;
+
+	return truepositions[num].active &&
+		truepositions[num].needrelink &&
+		truepositions[num].animstate.valid;
+}
+
+void SV_StudioSetupUnlagBones(model_t *pModel, float frame, int sequence, const vec_t *angles, const vec_t *origin, const unsigned char *pcontroller, const unsigned char *pblending, int iBone, const edict_t *edict)
+{
+	// During the lag-compensation window (nofind == 0) recompute the target's
+	// bones from the animation inputs captured in the shooter's snapshot that
+	// the position rewind is based on. Only applies when the position was
+	// actually rewound (needrelink); otherwise current bones already match
+	// what the shooter sees.
+	if (SV_InStudioUnlagRewind(edict))
+	{
+		int num = NUM_FOR_EDICT(edict) - 1;
+		vec3_t angles2;
+
+		// Hull/attachment call convention: negated pitch
+		// (see R_StudioHull / GetAttachment).
+		angles2[0] = -truepositions[num].animstate.angles[0];
+		angles2[1] = truepositions[num].animstate.angles[1];
+		angles2[2] = truepositions[num].animstate.angles[2];
+
+		g_pSvBlendingAPI->SV_StudioSetupBones(
+			pModel,
+			truepositions[num].animstate.frame,
+			truepositions[num].animstate.sequence,
+			angles2,
+			origin, // already the rewound origin
+			truepositions[num].animstate.controller,
+			truepositions[num].animstate.blending,
+			iBone,
+			edict
+		);
+		return;
+	}
+
+	g_pSvBlendingAPI->SV_StudioSetupBones(pModel, frame, sequence, angles, origin, pcontroller, pblending, iBone, edict);
+}
+#endif // REHLDS_FIXES
