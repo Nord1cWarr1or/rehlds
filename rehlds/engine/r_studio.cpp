@@ -802,11 +802,34 @@ hull_t *SV_HullForStudioModel(const edict_t *pEdict, const vec_t *mins, const ve
 			angles[1] = pEdict->v.angles[1];
 			angles[2] = pEdict->v.angles[2];
 
-			int iBlend;
-			R_StudioPlayerBlend(pseqdesc, &iBlend, angles);
+#ifdef REHLDS_FIXES
+			unsigned char blending[2];
+			unsigned char controller[4];
 
-			unsigned char blending[2] = { (unsigned char)iBlend, 0 };
-			unsigned char controller[4] = { 0x7F, 0x7F, 0x7F, 0x7F };
+			// R_StudioPlayerBlend is only valid for nine-way movement blends.
+			// Other sequences (reload, duck, C4 plant, longjump) carry their
+			// blending in the networked entity fields: use them so the traced
+			// hull matches the pose clients render. Gated by sv_bone_unlag.
+			if (sv_bone_unlag.value != 0.0f && pseqdesc->numblends != 9)
+			{
+				blending[0] = pEdict->v.blending[0];
+				blending[1] = pEdict->v.blending[1];
+				Q_memcpy(controller, pEdict->v.controller, sizeof(controller));
+			}
+			else
+#endif
+			{
+				int iBlend;
+				R_StudioPlayerBlend(pseqdesc, &iBlend, angles);
+
+				blending[0] = (unsigned char)iBlend;
+				blending[1] = 0;
+				controller[0] = 0x7F;
+				controller[1] = 0x7F;
+				controller[2] = 0x7F;
+				controller[3] = 0x7F;
+			}
+
 			return R_StudioHull(
 				g_psv.models[pEdict->v.modelindex],
 				pEdict->v.frame,

@@ -12,6 +12,7 @@ Along with reverse engineering, a lot of defects and (potential) bugs were found
 - Unlag (`sv_unlagsamples` > 1): latency estimate is now the median of the last N valid frame RTT samples instead of a single-sample average with a variance kill-switch; the default behavior (`sv_unlagsamples` 1) is unchanged;
 - Unlag (`sv_unlaghull`, default `0`): optional rewind of the victim's duck hull together with the origin, fixing hit checks against "mixed" boxes (past origin + present hull) for crouch-spamming targets; player movement keeps colliding with the true hull while the compensation window is active;
 - Unlag (`sv_bone_unlag`, default `0`): bone-based lag compensation — the shooter's snapshot stores each player's historical animation inputs (frame/sequence/angles/controller/blending) and studio hitbox traces during the rewind window rebuild bones from them, so hitboxes match what the shooter actually saw; the studio hull cache is bypassed while the rewind window is active;
+- Studio hull tracing (`sv_bone_unlag`, default `0`): for non-nine-way sequences (reload, duck, C4 plant, longjump) the player hitbox hull is built from the networked entity blending/controller instead of `R_StudioPlayerBlend`, which is only meaningful for nine-way movement blends;
 
 ## [`3.14.0.857`](https://github.com/rehlds/rehlds/releases/tag/3.14.0.857) - 2025-03-27
 
