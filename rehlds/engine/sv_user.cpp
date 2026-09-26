@@ -1177,9 +1177,8 @@ float SV_CalcClientTime(client_t *cl)
 	if (backtrack <= 0)
 		return 0.0f;
 
-	// sv_unlagsamples > 1: use the median of the last N valid samples and drop the
-	// variance kill-switch; the median itself is robust against jitter outliers.
-	// sv_unlagsamples 1 keeps the original behavior below.
+	// sv_unlagsamples > 1: median of the last N valid samples, no variance
+	// kill-switch. sv_unlagsamples 1 keeps the original behavior below.
 	if (backtrack > 1)
 	{
 		float samples[MAX_UNLAG_SAMPLES];
