@@ -35,6 +35,9 @@
 
 const int CMD_MAXBACKUP = 64;
 
+// Maximum number of latency samples used by the unlag latency estimator (SV_ComputeUnlagLatency)
+const int MAX_UNLAG_SAMPLES = 16;
+
 typedef struct sv_adjusted_positions_s
 {
 	int active;
@@ -93,6 +96,7 @@ void SV_ForceFullClientsUpdate(void);
 void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd = FALSE, qboolean fChopped = FALSE);
 int SV_ValidateClientCommand(char *pszCommand);
 float SV_CalcClientTime(client_t *cl);
+float SV_ComputeUnlagLatency(const float *samples, int count);
 void SV_ComputeLatency(client_t *cl);
 int SV_UnlagCheckTeleport(vec_t *v1, vec_t *v2);
 void SV_GetTrueOrigin(int player, vec_t *origin);

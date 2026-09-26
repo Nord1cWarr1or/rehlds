@@ -6,6 +6,11 @@ Along with reverse engineering, a lot of defects and (potential) bugs were found
 
 ---
 
+## Unreleased
+
+### Added
+- Unlag: robust latency estimation for lag compensation: `sv_unlagsamples` values greater than `1` now use the median of the last N valid frame RTT samples (immune to jitter outliers) instead of a single-sample average with a variance kill-switch; the default behavior (`sv_unlagsamples 1`) is unchanged;
+
 ## [`3.14.0.857`](https://github.com/rehlds/rehlds/releases/tag/3.14.0.857) - 2025-03-27
 
 ### Added

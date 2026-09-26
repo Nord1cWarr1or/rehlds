@@ -1105,6 +1105,46 @@ int SV_ValidateClientCommand(char *pszCommand)
 	return 0;
 }
 
+// Returns the median of the valid (positive) latency samples.
+// Robust against jitter outliers: a single spike does not move the median.
+// For an even number of valid samples the average of the two central values is used.
+float SV_ComputeUnlagLatency(const float *samples, int count)
+{
+	float sorted[MAX_UNLAG_SAMPLES];
+	int numsamples = 0;
+
+	if (!samples || count <= 0)
+		return 0.0f;
+
+	for (int i = 0; i < count && numsamples < MAX_UNLAG_SAMPLES; i++)
+	{
+		if (samples[i] > 0.0f)
+			sorted[numsamples++] = samples[i];
+	}
+
+	if (!numsamples)
+		return 0.0f;
+
+	for (int i = 1; i < numsamples; i++)
+	{
+		float value = sorted[i];
+		int j = i - 1;
+
+		while (j >= 0 && sorted[j] > value)
+		{
+			sorted[j + 1] = sorted[j];
+			j--;
+		}
+
+		sorted[j + 1] = value;
+	}
+
+	if (numsamples & 1)
+		return sorted[numsamples / 2];
+
+	return (sorted[numsamples / 2 - 1] + sorted[numsamples / 2]) * 0.5f;
+}
+
 float SV_CalcClientTime(client_t *cl)
 {
 	float minping;
@@ -1123,6 +1163,26 @@ float SV_CalcClientTime(client_t *cl)
 
 	if (backtrack <= 0)
 		return 0.0f;
+
+	// sv_unlagsamples > 1: use the median of the last N valid samples and drop the
+	// variance kill-switch; the median itself is robust against jitter outliers.
+	// sv_unlagsamples 1 keeps the original behavior below.
+	if (backtrack > 1)
+	{
+		float samples[MAX_UNLAG_SAMPLES];
+		int numsamples = 0;
+
+		for (int i = 0; i < backtrack; i++)
+		{
+			client_frame_t *frame = &cl->frames[SV_UPDATE_MASK & (cl->netchan.incoming_acknowledged - i)];
+			if (frame->ping_time <= 0.0f)
+				continue;
+
+			samples[numsamples++] = frame->ping_time;
+		}
+
+		return SV_ComputeUnlagLatency(samples, numsamples);
+	}
 
 	for (int i = 0; i < backtrack; i++)
 	{
