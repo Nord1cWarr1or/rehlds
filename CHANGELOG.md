@@ -10,6 +10,7 @@ Along with reverse engineering, a lot of defects and (potential) bugs were found
 
 ### Added
 - Unlag: robust latency estimation for lag compensation: `sv_unlagsamples` values greater than `1` now use the median of the last N valid frame RTT samples (immune to jitter outliers) instead of a single-sample average with a variance kill-switch; the default behavior (`sv_unlagsamples 1`) is unchanged;
+- Unlag: optional duck hull rewind for lag compensation: new cvar `sv_unlaghull` (default `0`) rewinds the victim's duck hull together with the origin, fixing hit checks against "mixed" boxes (past origin + present hull) for crouch-spamming targets; while the compensation window is active, player movement keeps colliding with the true hull;
 
 ## [`3.14.0.857`](https://github.com/rehlds/rehlds/releases/tag/3.14.0.857) - 2025-03-27
 

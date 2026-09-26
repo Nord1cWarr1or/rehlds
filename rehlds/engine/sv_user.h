@@ -47,6 +47,10 @@ typedef struct sv_adjusted_positions_s
 	vec3_t initial_correction_org;
 	vec3_t oldabsmin;
 	vec3_t oldabsmax;
+	vec3_t oldmins;
+	vec3_t oldmaxs;
+	int oldusehull;
+	int hullswapped;
 	int deadflag;
 	vec3_t temp_org;
 	int temp_org_setflag;
@@ -74,6 +78,7 @@ extern cvar_t sv_unlag;
 extern cvar_t sv_maxunlag;
 extern cvar_t sv_unlagpush;
 extern cvar_t sv_unlagsamples;
+extern cvar_t sv_unlaghull;
 extern cvar_t mp_consistency;
 extern cvar_t sv_voiceenable;
 

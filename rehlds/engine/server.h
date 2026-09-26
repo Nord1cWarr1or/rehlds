@@ -176,6 +176,7 @@ typedef struct client_frame_s
 	clientdata_t clientdata;
 	weapon_data_t weapondata[64];
 	packet_entities_t entities;
+	byte usehull[MAX_CLIENTS + 1]; // per-player duck state at frame time (entity-number indexed, used by the unlag hull rewind)
 } client_frame_t;
 
 typedef struct client_s

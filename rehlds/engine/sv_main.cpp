@@ -5025,6 +5025,15 @@ void SV_WriteEntitiesToClient(client_t *client, sizebuf_t *msg)
 		Q_memcpy(pack->entities, fullpack.entities, sizeof(entity_state_t) * pack->num_entities);
 #endif
 
+	// Record per-player duck state alongside the packed origins (used by the unlag hull rewind)
+	Q_memset(frame->usehull, 0, sizeof(frame->usehull));
+	for (int i = 0; i < pack->num_entities; i++)
+	{
+		int number = pack->entities[i].number;
+		if (number > 0 && number <= g_psvs.maxclients)
+			frame->usehull[number] = (g_psv.edicts[number].v.flags & FL_DUCKING) ? 1 : 0;
+	}
+
 	SV_EmitPacketEntities(client, pack, msg);
 	SV_EmitEvents(client, pack, msg);
 	if (sendping)
@@ -8459,6 +8468,7 @@ void SV_Init(void)
 	Cvar_RegisterVariable(&sv_maxunlag);
 	Cvar_RegisterVariable(&sv_unlagpush);
 	Cvar_RegisterVariable(&sv_unlagsamples);
+	Cvar_RegisterVariable(&sv_unlaghull);
 	Cvar_RegisterVariable(&sv_filterban);
 	Cvar_RegisterVariable(&sv_maxupdaterate);
 	Cvar_RegisterVariable(&sv_minupdaterate);

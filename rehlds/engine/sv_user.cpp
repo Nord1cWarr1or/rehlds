@@ -57,6 +57,7 @@ cvar_t sv_unlag = { "sv_unlag", "1", 0, 0.0f, NULL };
 cvar_t sv_maxunlag = { "sv_maxunlag", "0.5", 0, 0.0f, NULL };
 cvar_t sv_unlagpush = { "sv_unlagpush", "0.0", 0, 0.0f, NULL };
 cvar_t sv_unlagsamples = { "sv_unlagsamples", "1", 0, 0.0f, NULL };
+cvar_t sv_unlaghull = { "sv_unlaghull", "0", 0, 0.0f, NULL };
 cvar_t mp_consistency = { "mp_consistency", "1", FCVAR_SERVER, 0.0f, NULL };
 cvar_t sv_voiceenable = { "sv_voiceenable", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 0.0f, NULL };
 
@@ -473,6 +474,18 @@ void SV_CopyEdictToPhysent(physent_t *pe, int e, edict_t *check)
 			pe->maxs[1] = check->v.maxs[1];
 			pe->maxs[2] = check->v.maxs[2];
 		}
+	}
+
+	if (e >= 1 && e <= g_psvs.maxclients && truepositions[e - 1].hullswapped)
+	{
+		// The entity hull is currently rewound for unlag hit checks; player
+		// movement (pmove) must keep colliding with the true size.
+		pe->mins[0] = truepositions[e - 1].oldmins[0];
+		pe->mins[1] = truepositions[e - 1].oldmins[1];
+		pe->mins[2] = truepositions[e - 1].oldmins[2];
+		pe->maxs[0] = truepositions[e - 1].oldmaxs[0];
+		pe->maxs[1] = truepositions[e - 1].oldmaxs[1];
+		pe->maxs[2] = truepositions[e - 1].oldmaxs[2];
 	}
 
 	pe->skin = check->v.skin;
@@ -1287,6 +1300,47 @@ entity_state_t *SV_FindEntInPack(int index, packet_entities_t *pack)
 	return NULL;
 }
 
+// Returns the duck hull state of entity 'entnum' recorded in the frame pair surrounding
+// targettime (nearest frame wins). Falls back to 'fallback' when the entity is missing
+// from both frames.
+static int SV_FrameUseHull(client_frame_t *first, client_frame_t *second, double targettime, int entnum, int fallback)
+{
+	client_frame_t *frames[2];
+
+	if (first && second)
+	{
+		if (fabs(first->senttime - targettime) <= fabs(second->senttime - targettime))
+		{
+			frames[0] = first;
+			frames[1] = second;
+		}
+		else
+		{
+			frames[0] = second;
+			frames[1] = first;
+		}
+	}
+	else
+	{
+		frames[0] = first ? first : second;
+		frames[1] = NULL;
+	}
+
+	for (int f = 0; f < 2; f++)
+	{
+		if (!frames[f])
+			continue;
+
+		for (int i = 0; i < frames[f]->entities.num_entities; i++)
+		{
+			if (frames[f]->entities.entities[i].number == entnum)
+				return frames[f]->usehull[entnum];
+		}
+	}
+
+	return fallback;
+}
+
 void SV_SetupMove(client_t *_host_client)
 {
 	struct client_s *cl;
@@ -1336,6 +1390,13 @@ void SV_SetupMove(client_t *_host_client)
 		truepositions[i].oldabsmax[1] = cl->edict->v.absmax[1];
 		truepositions[i].active = 1;
 		truepositions[i].oldabsmax[2] = cl->edict->v.absmax[2];
+		truepositions[i].oldmins[0] = cl->edict->v.mins[0];
+		truepositions[i].oldmins[1] = cl->edict->v.mins[1];
+		truepositions[i].oldmins[2] = cl->edict->v.mins[2];
+		truepositions[i].oldmaxs[0] = cl->edict->v.maxs[0];
+		truepositions[i].oldmaxs[1] = cl->edict->v.maxs[1];
+		truepositions[i].oldmaxs[2] = cl->edict->v.maxs[2];
+		truepositions[i].oldusehull = (cl->edict->v.flags & FL_DUCKING) ? 1 : 0;
 	}
 
 	float clientLatency = _host_client->latency;
@@ -1497,7 +1558,19 @@ void SV_SetupMove(client_t *_host_client)
 		pos->initial_correction_org[0] = origin[0];
 		pos->initial_correction_org[1] = origin[1];
 		pos->initial_correction_org[2] = origin[2];
-		if (!VectorCompare(origin, cl->edict->v.origin))
+
+		// Optionally rewind the duck hull together with the origin (sv_unlaghull)
+		int usehull = pos->oldusehull;
+		if (sv_unlaghull.value != 0.0f)
+			usehull = SV_FrameUseHull(frame, nextFrame, targettime, state->number, pos->oldusehull);
+
+		if (usehull != pos->oldusehull)
+		{
+			SetMinMaxSize(cl->edict, player_mins[usehull], player_maxs[usehull], 0);
+			pos->hullswapped = 1;
+		}
+
+		if (!VectorCompare(origin, cl->edict->v.origin) || pos->hullswapped)
 		{
 			cl->edict->v.origin[0] = origin[0];
 			cl->edict->v.origin[1] = origin[1];
@@ -1536,13 +1609,22 @@ void SV_RestoreMove(client_t *_host_client)
 		if (cli == _host_client ||! cli->active)
 			continue;
 
-		if (VectorCompare(pos->neworg, pos->oldorg) || !pos->needrelink)
+		if (!pos->needrelink)
 			continue;
 
 		if (!pos->active)
 		{
 			Con_DPrintf("SV_RestoreMove:  Tried to restore 'inactive' player %i/%s\n", i, &cli->name[4]);
 			continue;
+		}
+
+		if (pos->hullswapped)
+		{
+			// A victim must never keep a foreign hull, restore it even if the
+			// game DLL moved it away from the corrected origin.
+			SetMinMaxSize(cli->edict, pos->oldmins, pos->oldmaxs, 0);
+			pos->hullswapped = 0;
+			SV_LinkEdict(cli->edict, FALSE);
 		}
 
 		if (VectorCompare(pos->initial_correction_org, cli->edict->v.origin))
