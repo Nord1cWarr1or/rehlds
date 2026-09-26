@@ -98,11 +98,12 @@ This means that plugins that do binary code analysis (Orpheu for example) probab
 <li>sv_rehlds_movecmd_max_ticks // Set maximum amount of movement commands the server is able to process from a single player in a single frame. This includes the commands itself, not packets. Default: 24
 <li>sv_rehlds_movecmd_max_null_streak // Defines the maximum allowed consecutive movement commands with zero time duration (empty commands). 0 - disables the check. Default: 0
 <li>sv_rehlds_movecmd_clamp_interp &lt;1|0&gt; // Defines whether should the server block movement commands with invalid (out of range) "ex_interp" value. Default: 1
-<li>sv_rehlds_movecmdtime_samples // Defines the number of frames the server takes to average the client's movement speed. Higher - more accurate but slower detection, lower - vice versa. Default: 120
-<li>sv_rehlds_movecmdtime_max_error // Defines how far a client's internal game clock can go ahead of or behind the server's clock in milliseconds. If this limit is exceeded, the server evaluates the client's game speed. Penalties are ONLY applied if the client also violates the "sv_rehlds_movecmdtime_max_scale" or "sv_rehlds_movecmdtime_min_scale" limits. Default: 300
-<li>sv_rehlds_movecmdtime_max_scale // Defines the max client's base game speed ratio. Clients speeding the game up beyond this multiplier will receive warnings. Default: 3.0
-<li>sv_rehlds_movecmdtime_min_scale // Defines the min client's base game speed ratio. Clients slowing the game down below this multiplier will receive warnings. Default: 0.5
+<li>sv_rehlds_movecmdtime_samples // Master switch for the time-speed detector: 0 disables it. (Legacy averaging knob; the current engine measures the client's game-time speed over a ~60s sliding window instead.) Default: 120
+<li>sv_rehlds_movecmdtime_max_scale // Defines the max client's game-time speed ratio. Clients running the game faster than this multiplier (measured over a sliding window) receive warnings. Default: 3.0
+<li>sv_rehlds_movecmdtime_min_scale // Defines the min client's game-time speed ratio. Clients running the game slower than this multiplier (measured over a sliding window) receive warnings. Default: 0.5
+<li>sv_rehlds_movecmdtime_rate_min_window // Minimum real-time span (seconds) the sliding speed window must cover before a speed judgment is made. Higher - smoother, but slower reaction. Default: 15
 <li>sv_rehlds_movecmdtime_max_warnings // Maximum allowed speedhack/slowmo warnings before the punishment is applied. -1 - disable detection. Default: -1
+<li>sv_rehlds_movecmdtime_gap_reset // Client silence intervals longer than this (seconds) are excluded from the speed measurement: AFK, minimized game and level load are not slowmo evidence. Default: 0.5
 <li>sv_rehlds_movecmdtime_punish // Time in minutes for which the player will be banned for speedhacking/slowing (-1 - Kick, 0 - Permanent, use a negative number for a kick). Default: -1
 <li>sv_reconnect_timeout // Hard deadline in seconds for a client to re-initiate its connection after a level change, independent of netchan activity. Closes a phantom-slot exploit where a cheat blocks the "reconnect" command and keeps the netchan warm so sv_timeout never fires. 0 - disabled. Default: 30
 </ul>
