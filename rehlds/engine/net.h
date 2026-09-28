@@ -105,7 +105,11 @@ enum
 };
 
 // Flow control bytes per second limits
+#ifdef REHLDS_FIXES
+const float MAX_RATE		= 1000000.0f;
+#else
 const float MAX_RATE		= 100000.0f;
+#endif
 const float MIN_RATE		= 1000.0f;
 
 // Default data rate
