@@ -29,7 +29,7 @@ const float DLFILE_BUCKET_MARGIN = 16.0f;
 cvar_t sv_rehlds_movecmd_max_ticks = { "sv_rehlds_movecmd_max_ticks", "24", 0, 24.0f, NULL };
 cvar_t sv_rehlds_movecmd_max_null_streak = { "sv_rehlds_movecmd_max_null_streak", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmd_clamp_interp = { "sv_rehlds_movecmd_clamp_interp", "1", 0, 1.0f, NULL };
-cvar_t sv_rehlds_movecmdtime_samples = { "sv_rehlds_movecmdtime_samples", "120", 0, 120.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_enabled = { "sv_rehlds_movecmdtime_enabled", "1", 0, 1.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_max_scale = { "sv_rehlds_movecmdtime_max_scale", "3.0", 0, 3.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_min_scale = { "sv_rehlds_movecmdtime_min_scale", "0.5", 0, 0.5f, NULL };
 cvar_t sv_rehlds_movecmdtime_punish = { "sv_rehlds_movecmdtime_punish", "-1", 0, -1.0f, NULL };
@@ -432,8 +432,9 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// Time speed detection
 	//
 
-	// sv_rehlds_movecmdtime_samples <= 0 keeps working as the detector master switch
-	if (sv_rehlds_movecmdtime_samples.value <= 0.0f) {
+	// sv_rehlds_movecmdtime_enabled 0 disables the whole time-speed layer:
+	// no budget, no rate measurement, no warnings
+	if (sv_rehlds_movecmdtime_enabled.value <= 0.0f) {
 		return false;
 	}
 
@@ -727,7 +728,7 @@ void Rehlds_Security_Init() {
 	Cvar_RegisterVariable(&sv_rehlds_movecmd_max_ticks);
 	Cvar_RegisterVariable(&sv_rehlds_movecmd_max_null_streak);
 	Cvar_RegisterVariable(&sv_rehlds_movecmd_clamp_interp);
-	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_samples);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_enabled);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_max_scale);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_min_scale);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_punish);
