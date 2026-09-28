@@ -197,6 +197,7 @@ set(UNITTESTS_SRCS
 	unittests/rehlds_tests_shared.h
 	unittests/security_tests.cpp
 	unittests/struct_offsets_tests.cpp
+	unittests/sv_unlag_tests.cpp
 	unittests/TestRunner.cpp
 	unittests/tmessage_tests.cpp
 	unittests/unicode_tests.cpp

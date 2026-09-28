@@ -609,7 +609,19 @@ hull_t *R_StudioHull(model_t *pModel, float frame, int sequence, const vec_t *an
 {
 	SV_InitStudioHull();
 
-	if (r_cachestudio.value != 0)
+#ifdef REHLDS_FIXES
+	// In the bone-unlag rewind window bones come from the historical snapshot
+	// inputs (SV_StudioSetupUnlagBones), while the cache key below is built
+	// from the live entity fields: reading or filling the cache there would
+	// serve/poison hulls for the wrong pose. Bypass it entirely.
+	qboolean boneUnlagRewind = SV_InStudioUnlagRewind(pEdict);
+#endif
+
+	if (r_cachestudio.value != 0
+#ifdef REHLDS_FIXES
+		&& !boneUnlagRewind
+#endif
+	)
 	{
 		r_studiocache_t *pCached = R_CheckStudioCache(pModel, frame, sequence, angles, origin, size, pcontroller, pblending);
 
@@ -627,7 +639,11 @@ hull_t *R_StudioHull(model_t *pModel, float frame, int sequence, const vec_t *an
 	pstudiohdr = (studiohdr_t *)Mod_Extradata(pModel);
 
 	vec_t angles2[3] = { -angles[0], angles[1], angles[2] };
+#ifdef REHLDS_FIXES
+	SV_StudioSetupUnlagBones(pModel, frame, sequence, angles2, origin, pcontroller, pblending, -1, pEdict);
+#else
 	g_pSvBlendingAPI->SV_StudioSetupBones(pModel, frame, sequence, angles2, origin, pcontroller, pblending, -1, pEdict);
+#endif
 
 #ifdef REHLDS_FIXES
 	const int hitboxShieldIndex = 20;
@@ -656,7 +672,11 @@ hull_t *R_StudioHull(model_t *pModel, float frame, int sequence, const vec_t *an
 	}
 
 	*pNumHulls = (bSkipShield == 1) ? pstudiohdr->numhitboxes - 1 : pstudiohdr->numhitboxes;
-	if (r_cachestudio.value != 0)
+	if (r_cachestudio.value != 0
+#ifdef REHLDS_FIXES
+		&& !boneUnlagRewind
+#endif
+	)
 	{
 		R_AddToStudioCache(frame, sequence, angles, origin, size, pcontroller, pblending, pModel, studio_hull, *pNumHulls);
 	}
@@ -782,11 +802,34 @@ hull_t *SV_HullForStudioModel(const edict_t *pEdict, const vec_t *mins, const ve
 			angles[1] = pEdict->v.angles[1];
 			angles[2] = pEdict->v.angles[2];
 
-			int iBlend;
-			R_StudioPlayerBlend(pseqdesc, &iBlend, angles);
+#ifdef REHLDS_FIXES
+			unsigned char blending[2];
+			unsigned char controller[4];
 
-			unsigned char blending[2] = { (unsigned char)iBlend, 0 };
-			unsigned char controller[4] = { 0x7F, 0x7F, 0x7F, 0x7F };
+			// R_StudioPlayerBlend is only valid for nine-way movement blends.
+			// Other sequences (reload, duck, C4 plant, longjump) carry their
+			// blending in the networked entity fields: use them so the traced
+			// hull matches the pose clients render. Gated by sv_bone_unlag.
+			if (sv_bone_unlag.value != 0.0f && pseqdesc->numblends != 9)
+			{
+				blending[0] = pEdict->v.blending[0];
+				blending[1] = pEdict->v.blending[1];
+				Q_memcpy(controller, pEdict->v.controller, sizeof(controller));
+			}
+			else
+#endif
+			{
+				int iBlend;
+				R_StudioPlayerBlend(pseqdesc, &iBlend, angles);
+
+				blending[0] = (unsigned char)iBlend;
+				blending[1] = 0;
+				controller[0] = 0x7F;
+				controller[1] = 0x7F;
+				controller[2] = 0x7F;
+				controller[3] = 0x7F;
+			}
+
 			return R_StudioHull(
 				g_psv.models[pEdict->v.modelindex],
 				pEdict->v.frame,
@@ -890,6 +933,19 @@ void EXT_FUNC GetBonePosition(const edict_t *pEdict, int iBone, float *rgflOrigi
 		return; // invalid bone
 #endif
 
+#ifdef REHLDS_FIXES
+	SV_StudioSetupUnlagBones(
+		g_psv.models[pEdict->v.modelindex],
+		pEdict->v.frame,
+		pEdict->v.sequence,
+		pEdict->v.angles,
+		pEdict->v.origin,
+		pEdict->v.controller,
+		pEdict->v.blending,
+		iBone,
+		pEdict
+	);
+#else
 	g_pSvBlendingAPI->SV_StudioSetupBones(
 		g_psv.models[pEdict->v.modelindex],
 		pEdict->v.frame,
@@ -901,6 +957,7 @@ void EXT_FUNC GetBonePosition(const edict_t *pEdict, int iBone, float *rgflOrigi
 		iBone,
 		pEdict
 	);
+#endif
 
 	if (rgflOrigin)
 	{
@@ -932,6 +989,19 @@ void EXT_FUNC GetAttachment(const edict_t *pEdict, int iAttachment, float *rgflO
 	angles[1] = pEdict->v.angles[1];
 	angles[2] = pEdict->v.angles[2];
 
+#ifdef REHLDS_FIXES
+	SV_StudioSetupUnlagBones(
+		g_psv.models[pEdict->v.modelindex],
+		pEdict->v.frame,
+		pEdict->v.sequence,
+		angles,
+		pEdict->v.origin,
+		pEdict->v.controller,
+		pEdict->v.blending,
+		pattachment->bone,
+		pEdict
+	);
+#else
 	g_pSvBlendingAPI->SV_StudioSetupBones(
 		g_psv.models[pEdict->v.modelindex],
 		pEdict->v.frame,
@@ -943,6 +1013,7 @@ void EXT_FUNC GetAttachment(const edict_t *pEdict, int iAttachment, float *rgflO
 		pattachment->bone,
 		pEdict
 	);
+#endif
 
 	if (rgflOrigin)
 		VectorTransform(pattachment->org, bonetransform[pattachment->bone], rgflOrigin);

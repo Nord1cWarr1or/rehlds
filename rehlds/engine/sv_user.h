@@ -35,6 +35,9 @@
 
 const int CMD_MAXBACKUP = 64;
 
+// Maximum number of latency samples used by the unlag latency estimator (SV_ComputeUnlagLatency)
+const int MAX_UNLAG_SAMPLES = 16;
+
 typedef struct sv_adjusted_positions_s
 {
 	int active;
@@ -44,9 +47,16 @@ typedef struct sv_adjusted_positions_s
 	vec3_t initial_correction_org;
 	vec3_t oldabsmin;
 	vec3_t oldabsmax;
+	vec3_t oldmins;
+	vec3_t oldmaxs;
+	int oldusehull;
+	int hullswapped;
 	int deadflag;
 	vec3_t temp_org;
 	int temp_org_setflag;
+#ifdef REHLDS_FIXES
+	player_anim_state_t animstate;
+#endif
 } sv_adjusted_positions_t;
 
 typedef struct clc_func_s
@@ -68,9 +78,13 @@ extern cvar_t sv_footsteps;
 extern cvar_t sv_rollspeed;
 extern cvar_t sv_rollangle;
 extern cvar_t sv_unlag;
+#ifdef REHLDS_FIXES
+extern cvar_t sv_bone_unlag;
+#endif
 extern cvar_t sv_maxunlag;
 extern cvar_t sv_unlagpush;
 extern cvar_t sv_unlagsamples;
+extern cvar_t sv_unlaghull;
 extern cvar_t mp_consistency;
 extern cvar_t sv_voiceenable;
 
@@ -93,6 +107,7 @@ void SV_ForceFullClientsUpdate(void);
 void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd = FALSE, qboolean fChopped = FALSE);
 int SV_ValidateClientCommand(char *pszCommand);
 float SV_CalcClientTime(client_t *cl);
+float SV_ComputeUnlagLatency(const float *samples, int count);
 void SV_ComputeLatency(client_t *cl);
 int SV_UnlagCheckTeleport(vec_t *v1, vec_t *v2);
 void SV_GetTrueOrigin(int player, vec_t *origin);
@@ -114,3 +129,8 @@ qboolean SV_SetPlayer(int idnum);
 void SV_ShowServerinfo_f(void);
 void SV_SendEnts_f(void);
 void SV_FullUpdate_f(void);
+
+#ifdef REHLDS_FIXES
+qboolean SV_InStudioUnlagRewind(const edict_t *edict);
+void SV_StudioSetupUnlagBones(model_t *pModel, float frame, int sequence, const vec_t *angles, const vec_t *origin, const unsigned char *pcontroller, const unsigned char *pblending, int iBone, const edict_t *edict);
+#endif

@@ -106,6 +106,7 @@ This means that plugins that do binary code analysis (Orpheu for example) probab
 <li>sv_rehlds_movecmdtime_gap_reset // Client silence intervals longer than this (seconds) are excluded from the speed measurement: AFK, minimized game and level load are not slowmo evidence. Default: 0.5
 <li>sv_rehlds_movecmdtime_punish // Time in minutes for which the player will be banned for speedhacking/slowing (-1 - Kick, 0 - Permanent, use a negative number for a kick). Default: -1
 <li>sv_reconnect_timeout // Hard deadline in seconds for a client to re-initiate its connection after a level change, independent of netchan activity. Closes a phantom-slot exploit where a cheat blocks the "reconnect" command and keeps the netchan warm so sv_timeout never fires. 0 - disabled. Default: 30
+<li>sv_bone_unlag &lt;1|0&gt; // Store each player's animation inputs in the shooter's snapshot and rebuild studio hitbox bones from them during lag compensation, so hitboxes match what the shooter saw. Requires sv_unlag 1. Default: 0
 </ul>
 </details>
 

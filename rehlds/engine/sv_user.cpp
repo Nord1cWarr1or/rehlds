@@ -54,9 +54,13 @@ cvar_t sv_footsteps = { "mp_footsteps", "1", FCVAR_SERVER, 0.0f, NULL };
 cvar_t sv_rollspeed = { "sv_rollspeed", "0.0", 0, 0.0f, NULL };
 cvar_t sv_rollangle = { "sv_rollangle", "0.0", 0, 0.0f, NULL };
 cvar_t sv_unlag = { "sv_unlag", "1", 0, 0.0f, NULL };
+#ifdef REHLDS_FIXES
+cvar_t sv_bone_unlag = { "sv_bone_unlag", "0", 0, 0.0f, NULL };
+#endif
 cvar_t sv_maxunlag = { "sv_maxunlag", "0.5", 0, 0.0f, NULL };
 cvar_t sv_unlagpush = { "sv_unlagpush", "0.0", 0, 0.0f, NULL };
 cvar_t sv_unlagsamples = { "sv_unlagsamples", "1", 0, 0.0f, NULL };
+cvar_t sv_unlaghull = { "sv_unlaghull", "0", 0, 0.0f, NULL };
 cvar_t mp_consistency = { "mp_consistency", "1", FCVAR_SERVER, 0.0f, NULL };
 cvar_t sv_voiceenable = { "sv_voiceenable", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 0.0f, NULL };
 
@@ -473,6 +477,18 @@ void SV_CopyEdictToPhysent(physent_t *pe, int e, edict_t *check)
 			pe->maxs[1] = check->v.maxs[1];
 			pe->maxs[2] = check->v.maxs[2];
 		}
+	}
+
+	if (e >= 1 && e <= g_psvs.maxclients && truepositions[e - 1].hullswapped)
+	{
+		// The entity hull is currently rewound for unlag hit checks; player
+		// movement (pmove) must keep colliding with the true size.
+		pe->mins[0] = truepositions[e - 1].oldmins[0];
+		pe->mins[1] = truepositions[e - 1].oldmins[1];
+		pe->mins[2] = truepositions[e - 1].oldmins[2];
+		pe->maxs[0] = truepositions[e - 1].oldmaxs[0];
+		pe->maxs[1] = truepositions[e - 1].oldmaxs[1];
+		pe->maxs[2] = truepositions[e - 1].oldmaxs[2];
 	}
 
 	pe->skin = check->v.skin;
@@ -1111,6 +1127,46 @@ int SV_ValidateClientCommand(char *pszCommand)
 	return 0;
 }
 
+// Returns the median of the valid (positive) latency samples.
+// Robust against jitter outliers: a single spike does not move the median.
+// For an even number of valid samples the average of the two central values is used.
+float SV_ComputeUnlagLatency(const float *samples, int count)
+{
+	float sorted[MAX_UNLAG_SAMPLES];
+	int numsamples = 0;
+
+	if (!samples || count <= 0)
+		return 0.0f;
+
+	for (int i = 0; i < count && numsamples < MAX_UNLAG_SAMPLES; i++)
+	{
+		if (samples[i] > 0.0f)
+			sorted[numsamples++] = samples[i];
+	}
+
+	if (!numsamples)
+		return 0.0f;
+
+	for (int i = 1; i < numsamples; i++)
+	{
+		float value = sorted[i];
+		int j = i - 1;
+
+		while (j >= 0 && sorted[j] > value)
+		{
+			sorted[j + 1] = sorted[j];
+			j--;
+		}
+
+		sorted[j + 1] = value;
+	}
+
+	if (numsamples & 1)
+		return sorted[numsamples / 2];
+
+	return (sorted[numsamples / 2 - 1] + sorted[numsamples / 2]) * 0.5f;
+}
+
 float SV_CalcClientTime(client_t *cl)
 {
 	float minping;
@@ -1129,6 +1185,25 @@ float SV_CalcClientTime(client_t *cl)
 
 	if (backtrack <= 0)
 		return 0.0f;
+
+	// sv_unlagsamples > 1: median of the last N valid samples, no variance
+	// kill-switch. sv_unlagsamples 1 keeps the original behavior below.
+	if (backtrack > 1)
+	{
+		float samples[MAX_UNLAG_SAMPLES];
+		int numsamples = 0;
+
+		for (int i = 0; i < backtrack; i++)
+		{
+			client_frame_t *frame = &cl->frames[SV_UPDATE_MASK & (cl->netchan.incoming_acknowledged - i)];
+			if (frame->ping_time <= 0.0f)
+				continue;
+
+			samples[numsamples++] = frame->ping_time;
+		}
+
+		return SV_ComputeUnlagLatency(samples, numsamples);
+	}
 
 	for (int i = 0; i < backtrack; i++)
 	{
@@ -1233,6 +1308,47 @@ entity_state_t *SV_FindEntInPack(int index, packet_entities_t *pack)
 	return NULL;
 }
 
+// Returns the duck hull state of entity 'entnum' recorded in the frame pair surrounding
+// targettime (nearest frame wins). Falls back to 'fallback' when the entity is missing
+// from both frames.
+static int SV_FrameUseHull(client_frame_t *first, client_frame_t *second, double targettime, int entnum, int fallback)
+{
+	client_frame_t *frames[2];
+
+	if (first && second)
+	{
+		if (fabs(first->senttime - targettime) <= fabs(second->senttime - targettime))
+		{
+			frames[0] = first;
+			frames[1] = second;
+		}
+		else
+		{
+			frames[0] = second;
+			frames[1] = first;
+		}
+	}
+	else
+	{
+		frames[0] = first ? first : second;
+		frames[1] = NULL;
+	}
+
+	for (int f = 0; f < 2; f++)
+	{
+		if (!frames[f])
+			continue;
+
+		for (int i = 0; i < frames[f]->entities.num_entities; i++)
+		{
+			if (frames[f]->entities.entities[i].number == entnum)
+				return frames[f]->usehull[entnum];
+		}
+	}
+
+	return fallback;
+}
+
 void SV_SetupMove(client_t *_host_client)
 {
 	struct client_s *cl;
@@ -1282,6 +1398,13 @@ void SV_SetupMove(client_t *_host_client)
 		truepositions[i].oldabsmax[1] = cl->edict->v.absmax[1];
 		truepositions[i].active = 1;
 		truepositions[i].oldabsmax[2] = cl->edict->v.absmax[2];
+		truepositions[i].oldmins[0] = cl->edict->v.mins[0];
+		truepositions[i].oldmins[1] = cl->edict->v.mins[1];
+		truepositions[i].oldmins[2] = cl->edict->v.mins[2];
+		truepositions[i].oldmaxs[0] = cl->edict->v.maxs[0];
+		truepositions[i].oldmaxs[1] = cl->edict->v.maxs[1];
+		truepositions[i].oldmaxs[2] = cl->edict->v.maxs[2];
+		truepositions[i].oldusehull = (cl->edict->v.flags & FL_DUCKING) ? 1 : 0;
 	}
 
 	float clientLatency = _host_client->latency;
@@ -1424,6 +1547,14 @@ void SV_SetupMove(client_t *_host_client)
 
 		pnextstate = SV_FindEntInPack(state->number, &frame->entities);
 
+#ifdef REHLDS_FIXES
+		// Take the animation inputs from the same snapshot the position
+		// interpolation comes from. No interpolation of animation state:
+		// snapping to nextFrame is at most one snapshot stale and avoids
+		// angle-wrap and sequence-change artifacts.
+		pos->animstate = nextFrame->animstate[state->number - 1];
+#endif
+
 		if (pnextstate)
 		{
 			delta[0] = pnextstate->origin[0] - state->origin[0];
@@ -1443,7 +1574,19 @@ void SV_SetupMove(client_t *_host_client)
 		pos->initial_correction_org[0] = origin[0];
 		pos->initial_correction_org[1] = origin[1];
 		pos->initial_correction_org[2] = origin[2];
-		if (!VectorCompare(origin, cl->edict->v.origin))
+
+		// Optionally rewind the duck hull together with the origin (sv_unlaghull)
+		int usehull = pos->oldusehull;
+		if (sv_unlaghull.value != 0.0f)
+			usehull = SV_FrameUseHull(frame, nextFrame, targettime, state->number, pos->oldusehull);
+
+		if (usehull != pos->oldusehull)
+		{
+			SetMinMaxSize(cl->edict, player_mins[usehull], player_maxs[usehull], 0);
+			pos->hullswapped = 1;
+		}
+
+		if (!VectorCompare(origin, cl->edict->v.origin) || pos->hullswapped)
 		{
 			cl->edict->v.origin[0] = origin[0];
 			cl->edict->v.origin[1] = origin[1];
@@ -1482,7 +1625,7 @@ void SV_RestoreMove(client_t *_host_client)
 		if (cli == _host_client ||! cli->active)
 			continue;
 
-		if (VectorCompare(pos->neworg, pos->oldorg) || !pos->needrelink)
+		if (!pos->needrelink)
 			continue;
 
 		if (!pos->active)
@@ -1490,6 +1633,19 @@ void SV_RestoreMove(client_t *_host_client)
 			Con_DPrintf("SV_RestoreMove:  Tried to restore 'inactive' player %i/%s\n", i, &cli->name[4]);
 			continue;
 		}
+
+		if (pos->hullswapped)
+		{
+			// A victim must never keep a foreign hull, restore it even if the
+			// game DLL moved it away from the corrected origin.
+			SetMinMaxSize(cli->edict, pos->oldmins, pos->oldmaxs, 0);
+			pos->hullswapped = 0;
+			SV_LinkEdict(cli->edict, FALSE);
+		}
+
+#ifdef REHLDS_FIXES
+		pos->animstate.valid = false;
+#endif
 
 		if (VectorCompare(pos->initial_correction_org, cli->edict->v.origin))
 		{
@@ -2034,3 +2190,57 @@ void SV_FullUpdate_f(void)
 	gEntityInterface.pfnClientCommand(sv_player);
 #endif // REHLDS_FIXES
 }
+
+#ifdef REHLDS_FIXES
+qboolean SV_InStudioUnlagRewind(const edict_t *edict)
+{
+	if (!edict || sv_bone_unlag.value == 0.0f || nofind != 0)
+		return FALSE;
+
+	if (!(edict->v.flags & FL_CLIENT))
+		return FALSE;
+
+	int num = NUM_FOR_EDICT(edict) - 1;
+	if (num < 0 || num >= MAX_CLIENTS)
+		return FALSE;
+
+	return truepositions[num].active &&
+		truepositions[num].needrelink &&
+		truepositions[num].animstate.valid;
+}
+
+void SV_StudioSetupUnlagBones(model_t *pModel, float frame, int sequence, const vec_t *angles, const vec_t *origin, const unsigned char *pcontroller, const unsigned char *pblending, int iBone, const edict_t *edict)
+{
+	// During the lag-compensation window (nofind == 0) recompute the target's
+	// bones from the animation inputs captured in the shooter's snapshot that
+	// the position rewind is based on. Only applies when the position was
+	// actually rewound (needrelink); otherwise current bones already match
+	// what the shooter sees.
+	if (SV_InStudioUnlagRewind(edict))
+	{
+		int num = NUM_FOR_EDICT(edict) - 1;
+		vec3_t angles2;
+
+		// Hull/attachment call convention: negated pitch
+		// (see R_StudioHull / GetAttachment).
+		angles2[0] = -truepositions[num].animstate.angles[0];
+		angles2[1] = truepositions[num].animstate.angles[1];
+		angles2[2] = truepositions[num].animstate.angles[2];
+
+		g_pSvBlendingAPI->SV_StudioSetupBones(
+			pModel,
+			truepositions[num].animstate.frame,
+			truepositions[num].animstate.sequence,
+			angles2,
+			origin, // already the rewound origin
+			truepositions[num].animstate.controller,
+			truepositions[num].animstate.blending,
+			iBone,
+			edict
+		);
+		return;
+	}
+
+	g_pSvBlendingAPI->SV_StudioSetupBones(pModel, frame, sequence, angles, origin, pcontroller, pblending, iBone, edict);
+}
+#endif // REHLDS_FIXES
