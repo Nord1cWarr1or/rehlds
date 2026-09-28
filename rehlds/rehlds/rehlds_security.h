@@ -107,6 +107,7 @@ private:
 		uint64_t rateMsecMs;       // client time accumulated over the same intervals
 		uint64_t totalMsec;        // every msec since connect (diagnostics)
 		double avgMsec;            // EMA of per-command msec (client fps estimate)
+		double budgetMs;           // movement-time allowance (refills with wall time, spent by msec)
 
 		// speed window
 		rate_point_t ratePoints[RATE_POINTS_MAX];
@@ -123,6 +124,7 @@ private:
 		unsigned int ticksDrops;        // cmds dropped by sv_rehlds_movecmd_max_ticks
 		unsigned int nullDrops;         // cmds dropped by sv_rehlds_movecmd_max_null_streak
 		unsigned int interpDrops;       // cmds dropped by sv_rehlds_movecmd_clamp_interp
+		unsigned int budgetClamps;      // commands clipped by the movement-time budget
 		unsigned int abuseDrops[ABUSE_MAX]; // cmds dropped by abuse detection
 		unsigned int cwCount;           // vanilla clockwindow ignore windows set on this client
 		unsigned int cwSkippedCmds;     // cmds skipped during current/last clockwindow window

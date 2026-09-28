@@ -37,6 +37,7 @@ cvar_t sv_rehlds_movecmdtime_max_warnings = { "sv_rehlds_movecmdtime_max_warning
 cvar_t sv_rehlds_movecmdtime_debug = { "sv_rehlds_movecmdtime_debug", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_gap_reset = { "sv_rehlds_movecmdtime_gap_reset", "0.5", 0, 0.5f, NULL };
 cvar_t sv_rehlds_movecmdtime_rate_min_window = { "sv_rehlds_movecmdtime_rate_min_window", "15", 0, 15.0f, NULL };
+cvar_t sv_rehlds_movecmd_budget_max = { "sv_rehlds_movecmd_budget_max", "250", 0, 250.0f, NULL };
 
 CMoveCommandRateLimiter g_MoveCommandRateLimiter;
 CStringCommandsRateLimiter g_StringCommandsRateLimiter;
@@ -458,19 +459,50 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		&& sv_rehlds_movecmdtime_gap_reset.value > 0.0f
 		&& gapMs <= (uint64_t)(sv_rehlds_movecmdtime_gap_reset.value * 1000.0f));
 
-	if (ust->lastUpdateTime == 0) {
+	bool firstCmd = (ust->lastUpdateTime == 0);
+	if (firstCmd) {
 		ust->joinTime = now;
 		ust->lastUpdateTime = now;
 	}
 	ust->lastUpdateTime = now;
 
 	ust->totalMsec += ucmd->msec;
-	ust->avgMsec = (ust->avgMsec == 0.0) ? (double)ucmd->msec : ust->avgMsec * 0.95 + ucmd->msec * 0.05;
 
 	if (intervalValid) {
 		ust->rateWallMs += gapMs;
 		ust->rateMsecMs += ucmd->msec;
 	}
+
+	// Movement-time budget: the allowance refills with real wall time and
+	// each command spends the msec it asks for, so a client cannot move
+	// faster than real time - a speedhack loses its effect on the first
+	// depleted command, with no detection and no false positives. Lagging
+	// players are unaffected: their allowance refills during the lag, so a
+	// command burst after it is covered.
+	if (sv_rehlds_movecmd_budget_max.value > 0.0f)
+	{
+		double budgetMax = sv_rehlds_movecmd_budget_max.value;
+		if (firstCmd) {
+			ust->budgetMs = budgetMax;
+		} else if (gapMs > 0) {
+			double refilled = ust->budgetMs + gapMs;
+			ust->budgetMs = (refilled > budgetMax) ? budgetMax : refilled;
+		}
+
+		if (ucmd->msec > ust->budgetMs)
+		{
+			ust->budgetClamps++;
+			if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastDropLogTime >= 5.0) {
+				ust->lastDropLogTime = realtime;
+				MCmd_Log("BUDGET-CLAMP name=%s total=%u asked=%u granted=%.0fms",
+					cl->name, ust->budgetClamps, (int)ucmd->msec, ust->budgetMs);
+			}
+			ucmd->msec = (byte)ust->budgetMs;
+		}
+		ust->budgetMs -= ucmd->msec;
+	}
+
+	ust->avgMsec = (ust->avgMsec == 0.0) ? (double)ucmd->msec : ust->avgMsec * 0.95 + ucmd->msec * 0.05;
 
 	// sample a control point every RATE_POINT_STEP_MS of wall progress;
 	// a pause longer than RATE_PAUSE_RESET_MS makes the stored window stale
@@ -637,7 +669,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 
 	// clockRate drifts permanently after speedhack sessions (reported msec
 	// cannot be unreported) - rate above is the live metric
-	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) cw=%u skipped=%u restarts=%u msec=%llums age=%.0fs",
+	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u cw=%u skipped=%u restarts=%u msec=%llums age=%.0fs",
 		cl->name,
 		rate, winSec, clockRate,
 		ust->avgMsec,
@@ -646,6 +678,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		ust->telemWarn[ABUSE_SPEEDHACK], ust->telemWarn[ABUSE_SLOWMO],
 		ust->ticksDrops, ust->nullDrops, ust->interpDrops,
 		ust->abuseDrops[ABUSE_SPEEDHACK], ust->abuseDrops[ABUSE_SLOWMO],
+		ust->budgetClamps,
 		ust->cwCount, ust->cwSkippedTotal,
 		ust->rateRestarts,
 		(unsigned long long)ust->totalMsec,
@@ -702,6 +735,7 @@ void Rehlds_Security_Init() {
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_debug);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_gap_reset);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_rate_min_window);
+	Cvar_RegisterVariable(&sv_rehlds_movecmd_budget_max);
 #endif
 }
 
