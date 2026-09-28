@@ -98,7 +98,7 @@ This means that plugins that do binary code analysis (Orpheu for example) probab
 <li>sv_rehlds_movecmd_max_ticks // Set maximum amount of movement commands the server is able to process from a single player in a single frame. This includes the commands itself, not packets. Default: 24
 <li>sv_rehlds_movecmd_max_null_streak // Defines the maximum allowed consecutive movement commands with zero time duration (empty commands). 0 - disables the check. Default: 0
 <li>sv_rehlds_movecmd_clamp_interp &lt;1|0&gt; // Defines whether should the server block movement commands with invalid (out of range) "ex_interp" value. Default: 1
-<li>sv_rehlds_movecmdtime_samples // Master switch for the time-speed detector: 0 disables it. (Legacy averaging knob; the current engine measures the client's game-time speed over a ~60s sliding window instead.) Default: 120
+<li>sv_rehlds_movecmdtime_enabled // Master switch for the time-speed layer: 0 disables the movement-time budget, the speed measurement and all its warnings. Default: 1
 <li>sv_rehlds_movecmdtime_max_scale // Defines the max client's game-time speed ratio. Clients running the game faster than this multiplier (measured over a sliding window) receive warnings. Default: 3.0
 <li>sv_rehlds_movecmdtime_min_scale // Defines the min client's game-time speed ratio. Clients running the game slower than this multiplier (measured over a sliding window) receive warnings. Default: 0.5
 <li>sv_rehlds_movecmdtime_rate_min_window // Minimum real-time span (seconds) the sliding speed window must cover before a speed judgment is made. Higher - smoother, but slower reaction. Default: 15
