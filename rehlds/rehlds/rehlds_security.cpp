@@ -45,25 +45,18 @@ CUserCmdTimeLimiter g_UserCmdTimeLimiter;
 
 // movecmdtime telemetry: one line per event to logs/movecmdtime_debug.log
 // (falls back to the server dir, then to console). Collects data even when
-// punishment is disabled.
-static FILE *g_pMoveCmdTimeLog = NULL;
-
+// punishment is disabled. The file is opened per line, so deleting or
+// rotating it mid-run is safe - it gets recreated on the next event.
 static void MCmd_Log(const char *fmt, ...)
 {
 	char line[1024];
 	char stamp[32];
 	time_t t;
 	va_list args;
+	FILE *fp;
 
 	if (sv_rehlds_movecmdtime_debug.value < 1.0f) {
 		return;
-	}
-
-	if (!g_pMoveCmdTimeLog) {
-		g_pMoveCmdTimeLog = fopen("logs/movecmdtime_debug.log", "a");
-		if (!g_pMoveCmdTimeLog) {
-			g_pMoveCmdTimeLog = fopen("movecmdtime_debug.log", "a");
-		}
 	}
 
 	t = time(NULL);
@@ -73,9 +66,14 @@ static void MCmd_Log(const char *fmt, ...)
 	vsnprintf(line, sizeof(line), fmt, args);
 	va_end(args);
 
-	if (g_pMoveCmdTimeLog) {
-		fprintf(g_pMoveCmdTimeLog, "[%s rt=%.3f] %s\n", stamp, realtime, line);
-		fflush(g_pMoveCmdTimeLog);
+	fp = fopen("logs/movecmdtime_debug.log", "a");
+	if (!fp) {
+		fp = fopen("movecmdtime_debug.log", "a");
+	}
+
+	if (fp) {
+		fprintf(fp, "[%s rt=%.3f] %s\n", stamp, realtime, line);
+		fclose(fp);
 	} else {
 		Con_Printf("[mcmd %s rt=%.3f] %s\n", stamp, realtime, line);
 	}
