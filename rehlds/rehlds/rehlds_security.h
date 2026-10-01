@@ -125,6 +125,7 @@ private:
 		unsigned int nullDrops;         // cmds dropped by sv_rehlds_movecmd_max_null_streak
 		unsigned int interpDrops;       // cmds dropped by sv_rehlds_movecmd_clamp_interp
 		unsigned int budgetClamps;      // commands clipped by the movement-time budget
+		unsigned int batchImmuneSkipped; // slowmo warnings not accrued because a multi-player batch was detected
 		unsigned int abuseDrops[ABUSE_MAX]; // cmds dropped by abuse detection
 		unsigned int cwCount;           // vanilla clockwindow ignore windows set on this client
 		unsigned int cwSkippedCmds;     // cmds skipped during current/last clockwindow window
@@ -139,6 +140,7 @@ private:
 
 	private:
 		void PushRatePoint(usercmd_state_t *ust, double at, const char *name);
+		bool SlowmoBatchImmune(unsigned int clientId, client_t *cl, double realtime);
 	};
 
 extern CUserCmdTimeLimiter g_UserCmdTimeLimiter;
