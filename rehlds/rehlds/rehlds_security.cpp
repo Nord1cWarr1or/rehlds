@@ -387,8 +387,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 			// the client did play this time; without counting it the window
 			// tilts towards slowmo after every command burst that max_ticks
 			// trims. Park it and add to the window with the next accepted
-			// interval (dropped when that interval is invalid - excluded
-			// wall pairs with excluded msec).
+			// interval.
 			ust->pendingDroppedMsec += ucmd->msec;
 			if (sv_rehlds_movecmdtime_debug.value >= 2.0f && realtime - ust->lastDropLogTime >= 5.0) {
 				ust->lastDropLogTime = realtime;
@@ -452,7 +451,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	// A paused server or an FL_FROZEN client does not judge speeds: the
 	// engine zeroes such clients' msec in SV_ParseMove, so any measured
-	// slowdown would be the engine's doing, not the client's. Live-tested:
+	// slowdown would be the engine's doing, not the client's. Tested live:
 	// stock clients stop sending dense movecmds here, this gate covers
 	// custom builds that keep sending.
 	if (g_psv.paused || (sv_player->v.flags & FL_FROZEN)) {
@@ -504,9 +503,9 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// Movement-time budget: the allowance refills with real wall time (up
 	// to the cap) and each command spends the msec it asks for, so ordinary
 	// speedhacks lose their effect on the first depleted command. A burst
-	// after a lag is covered only up to the cap: whatever the client asks
-	// beyond it is clipped, the client re-predicts back - same behavior
-	// CS:GO ships with sv_maxusrcmdprocessticks.
+	// after a lag is covered only up to the cap - the excess is clipped and
+	// the client re-predicts back, the same behavior CS:GO ships with
+	// sv_maxusrcmdprocessticks.
 	if (sv_rehlds_movecmd_budget_max.value > 0.0f)
 	{
 		double budgetMax = sv_rehlds_movecmd_budget_max.value;
@@ -573,14 +572,12 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		ust->abuseDrops[(int)abuseType]++;
 		ust->telemWarn[(int)abuseType]++;
 
-		// server stall immunity: while the stall grace period lasts, slowmo
-		// detections are the server's fault - telemetry keeps counting,
-		// commands keep dropping, but no warnings accrue. A speedhack is a
-		// client-side property and is never covered by this.
-		// immunity covers the grace period after a confirmed stall AND the
-		// current frame itself: a command burst right after the stall is
-		// processed before the end-of-frame stall check would extend the
-		// grace, so judge the live frame delta here as well
+		// stall immunity: while the grace period lasts, slowmo detections
+		// are the server's fault - telemetry keeps counting, commands keep
+		// dropping, no warnings accrue. The check covers both the confirmed
+		// grace and the live frame delta: a burst right after the stall is
+		// processed before the end-of-frame check would extend the grace.
+		// A speedhack is a client-side property and is never covered.
 		bool stallImmune = (abuseType == ABUSE_SLOWMO
 			&& (realtime < g_stallUntil
 				|| (sv_rehlds_movecmdtime_stall_threshold.value > 0.0f
@@ -650,7 +647,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	else
 	{
 		// one warning of each type decays per minute of in-range speed,
-		// counted only while the window is ready to judge at all
+		// counted only while the window is ready to judge
 		if (ust->ratePointCount >= 2 && winSec >= sv_rehlds_movecmdtime_rate_min_window.value)
 		{
 			if (ust->stableSinceMs == 0) {
@@ -799,10 +796,8 @@ void Rehlds_Security_Shutdown() {
 
 void Rehlds_Security_Frame() {
 #ifdef REHLDS_FIXES
-	// server stall detection: frame-to-frame delta longer than the threshold
-	// (freeze, map load, background stall) pauses slowmo warning accrual for
-	// a grace period; every stalled frame extends it until the server
-	// stabilizes. Independent of debug - works while the detector is on.
+	// frame-to-frame stall detection (see the stall state above); runs
+	// independently of debug - it must work while the detector is on
 	if (g_lastFrameRealtime < 0.0) {
 		g_lastFrameRealtime = realtime;
 	}
