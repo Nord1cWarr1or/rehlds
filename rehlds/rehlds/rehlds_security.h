@@ -69,7 +69,7 @@ public:
 	bool CheckLimits(unsigned int clientId, usercmd_t *ucmd);
 	void ClientConnected(unsigned int clientId);
 
-	// telemetry hooks (debug/movecmdtime-telemetry branch)
+	// telemetry hooks
 	void OnClockWindowSet(unsigned int clientId, double dif);
 	void OnCmdSkippedByClockWindow(unsigned int clientId);
 
@@ -113,6 +113,7 @@ private:
 		rate_point_t ratePoints[RATE_POINTS_MAX];
 		int ratePointCount;
 		unsigned int rateRestarts; // window restarts after long silence
+		uint64_t pendingDroppedMsec; // time of max_ticks-dropped cmds, added to the window with the next accepted interval
 
 		// punishment state
 		unsigned int warnings[ABUSE_MAX];
@@ -136,11 +137,11 @@ private:
 		double lastDropLogTime;
 	};
 
-		usercmd_state_t m_States[MAX_CLIENTS];
+	usercmd_state_t m_States[MAX_CLIENTS];
 
-	private:
-		void PushRatePoint(usercmd_state_t *ust, double at, const char *name);
-	};
+private:
+	void PushRatePoint(usercmd_state_t *ust, double at, const char *name);
+};
 
 extern CUserCmdTimeLimiter g_UserCmdTimeLimiter;
 

@@ -384,12 +384,15 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	{
 		if (ust->ticksThisFrame >= (unsigned int)sv_rehlds_movecmd_max_ticks.value) {
 			ust->ticksDrops++;
-			// keep the drop period out of the speed window
-			ust->lastUpdateTime = now;
+			// the client did play this time; without counting it the window
+			// tilts towards slowmo after every command burst that max_ticks
+			// trims. Park it and add to the window with the next accepted
+			// interval (dropped when that interval is invalid - excluded
+			// wall pairs with excluded msec).
+			ust->pendingDroppedMsec += ucmd->msec;
 			if (sv_rehlds_movecmdtime_debug.value >= 2.0f && realtime - ust->lastDropLogTime >= 5.0) {
 				ust->lastDropLogTime = realtime;
-				// dropped BEFORE the speed accounting: wall time advances, client msec does not
-				MCmd_Log("DROP-TICKS name=%s total=%u limit=%u (cmd dropped, not counted in client clock)",
+				MCmd_Log("DROP-TICKS name=%s total=%u limit=%u (msec parked, added to the window with the next accepted interval)",
 					cl->name, ust->ticksDrops, (unsigned int)sv_rehlds_movecmd_max_ticks.value);
 			}
 			return true;
@@ -447,6 +450,15 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		return false;
 	}
 
+	// A paused server or an FL_FROZEN client does not judge speeds: the
+	// engine zeroes such clients' msec in SV_ParseMove, so any measured
+	// slowdown would be the engine's doing, not the client's. Live-tested:
+	// stock clients stop sending dense movecmds here, this gate covers
+	// custom builds that keep sending.
+	if (g_psv.paused || (sv_player->v.flags & FL_FROZEN)) {
+		return false;
+	}
+
 	// first command after a clockwindow ignore window; vanilla skipped every
 	// command in it before CheckLimits saw them - the gap rule below keeps
 	// that interval out of the speed accounting
@@ -480,15 +492,21 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	if (intervalValid) {
 		ust->rateWallMs += gapMs;
-		ust->rateMsecMs += ucmd->msec;
+		ust->rateMsecMs += ucmd->msec + ust->pendingDroppedMsec;
+		ust->pendingDroppedMsec = 0;
+	}
+	else if (ust->lastUpdateTime != 0 && !firstCmd) {
+		// invalid interval: its wall time stays out of the window, so the
+		// parked msec of commands dropped over it must stay out too
+		ust->pendingDroppedMsec = 0;
 	}
 
-	// Movement-time budget: the allowance refills with real wall time and
-	// each command spends the msec it asks for, so a client cannot move
-	// faster than real time - a speedhack loses its effect on the first
-	// depleted command, with no detection and no false positives. Lagging
-	// players are unaffected: their allowance refills during the lag, so a
-	// command burst after it is covered.
+	// Movement-time budget: the allowance refills with real wall time (up
+	// to the cap) and each command spends the msec it asks for, so ordinary
+	// speedhacks lose their effect on the first depleted command. A burst
+	// after a lag is covered only up to the cap: whatever the client asks
+	// beyond it is clipped, the client re-predicts back - same behavior
+	// CS:GO ships with sv_maxusrcmdprocessticks.
 	if (sv_rehlds_movecmd_budget_max.value > 0.0f)
 	{
 		double budgetMax = sv_rehlds_movecmd_budget_max.value;
@@ -505,7 +523,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 			if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastDropLogTime >= 5.0) {
 				ust->lastDropLogTime = realtime;
 				MCmd_Log("BUDGET-CLAMP name=%s total=%u asked=%u granted=%.0fms",
-					cl->name, ust->budgetClamps, (int)ucmd->msec, ust->budgetMs);
+					cl->name, ust->budgetClamps, (unsigned)ucmd->msec, ust->budgetMs);
 			}
 			ucmd->msec = (byte)ust->budgetMs;
 		}
@@ -559,7 +577,14 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		// detections are the server's fault - telemetry keeps counting,
 		// commands keep dropping, but no warnings accrue. A speedhack is a
 		// client-side property and is never covered by this.
-		bool stallImmune = (abuseType == ABUSE_SLOWMO && realtime < g_stallUntil);
+		// immunity covers the grace period after a confirmed stall AND the
+		// current frame itself: a command burst right after the stall is
+		// processed before the end-of-frame stall check would extend the
+		// grace, so judge the live frame delta here as well
+		bool stallImmune = (abuseType == ABUSE_SLOWMO
+			&& (realtime < g_stallUntil
+				|| (sv_rehlds_movecmdtime_stall_threshold.value > 0.0f
+					&& realtime - g_lastFrameRealtime > sv_rehlds_movecmdtime_stall_threshold.value)));
 		if (stallImmune) {
 			ust->stallImmuneSkipped++;
 			if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastDropLogTime >= 5.0)
@@ -619,19 +644,21 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 		// drop commands while the episode lasts: the client keeps gaining
 		// speed it did not play through
+		ust->stableSinceMs = 0;
 		return true;
 	}
 	else
 	{
-		// one warning of each type decays per minute of in-range speed
-		if (ust->ratePointCount >= 2 && winSec > 0.0)
+		// one warning of each type decays per minute of in-range speed,
+		// counted only while the window is ready to judge at all
+		if (ust->ratePointCount >= 2 && winSec >= sv_rehlds_movecmdtime_rate_min_window.value)
 		{
 			if (ust->stableSinceMs == 0) {
 				ust->stableSinceMs = now;
 			} else if (now - ust->stableSinceMs >= RATE_STABLE_DECAY_MS) {
 				if (ust->warnings[ABUSE_SPEEDHACK] > 0) ust->warnings[ABUSE_SPEEDHACK]--;
 				if (ust->warnings[ABUSE_SLOWMO] > 0) ust->warnings[ABUSE_SLOWMO]--;
-				ust->stableSinceMs = now - RATE_STABLE_DECAY_MS / 2;
+				ust->stableSinceMs = now;
 			}
 		} else {
 			ust->stableSinceMs = 0;
