@@ -330,6 +330,7 @@ void CUserCmdTimeLimiter::ClientConnected(unsigned int clientId)
 #define MIN_RATE_MSEC_MS     3000    // need this much reported client time to judge speed
 #define RATE_WARN_ACCRUE_MS  10000   // one warning accrual per this ms inside an episode
 #define RATE_STABLE_DECAY_MS 60000   // in-range speed time that forgives one warning
+#define BUDGET_REFILL_TOLERANCE 1.02 // budget refill speed relative to real time (client clock drift)
 
 // server stall state: a host frame longer than sv_rehlds_movecmdtime_stall_threshold
 // means the server could not process client commands (freeze, map load, background
@@ -480,10 +481,20 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		&& sv_rehlds_movecmdtime_gap_reset.value > 0.0f
 		&& gapMs <= (uint64_t)(sv_rehlds_movecmdtime_gap_reset.value * 1000.0f));
 
+	// The commands a client held during a long silence arrive as one burst
+	// processed in a single frame: only the first one sees the long gap, the
+	// rest see a zero gap. The whole burst belongs to the silence - counting
+	// its msec against zero wall time would inflate the measured speed of
+	// clients that choke or lag.
+	if (!intervalValid) {
+		ust->invalidBurstMs = now;
+	} else if (gapMs == 0 && now == ust->invalidBurstMs) {
+		intervalValid = false;
+	}
+
 	bool firstCmd = (ust->lastUpdateTime == 0);
 	if (firstCmd) {
 		ust->joinTime = now;
-		ust->lastUpdateTime = now;
 	}
 	ust->lastUpdateTime = now;
 
@@ -494,7 +505,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		ust->rateMsecMs += ucmd->msec + ust->pendingDroppedMsec;
 		ust->pendingDroppedMsec = 0;
 	}
-	else if (ust->lastUpdateTime != 0 && !firstCmd) {
+	else {
 		// invalid interval: its wall time stays out of the window, so the
 		// parked msec of commands dropped over it must stay out too
 		ust->pendingDroppedMsec = 0;
@@ -505,14 +516,16 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// speedhacks lose their effect on the first depleted command. A burst
 	// after a lag is covered only up to the cap - the excess is clipped and
 	// the client re-predicts back, the same behavior CS:GO ships with
-	// sv_maxusrcmdprocessticks.
+	// sv_maxusrcmdprocessticks. The refill runs slightly faster than real
+	// time: client clocks drift a fraction of a percent ahead of the server,
+	// and without the tolerance such clients sit at an empty budget for good.
 	if (sv_rehlds_movecmd_budget_max.value > 0.0f)
 	{
 		double budgetMax = sv_rehlds_movecmd_budget_max.value;
 		if (firstCmd) {
 			ust->budgetMs = budgetMax;
 		} else if (gapMs > 0) {
-			double refilled = ust->budgetMs + gapMs;
+			double refilled = ust->budgetMs + gapMs * BUDGET_REFILL_TOLERANCE;
 			ust->budgetMs = (refilled > budgetMax) ? budgetMax : refilled;
 		}
 
@@ -521,8 +534,8 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 			ust->budgetClamps++;
 			if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastDropLogTime >= 5.0) {
 				ust->lastDropLogTime = realtime;
-				MCmd_Log("BUDGET-CLAMP name=%s total=%u asked=%u granted=%.0fms",
-					cl->name, ust->budgetClamps, (unsigned)ucmd->msec, ust->budgetMs);
+				MCmd_Log("BUDGET-CLAMP name=%s total=%u asked=%u granted=%ums",
+					cl->name, ust->budgetClamps, (unsigned)ucmd->msec, (unsigned)(byte)ust->budgetMs);
 			}
 			ucmd->msec = (byte)ust->budgetMs;
 		}

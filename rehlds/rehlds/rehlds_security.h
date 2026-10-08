@@ -103,6 +103,7 @@ private:
 		// time accounting (accepted commands only)
 		uint64_t joinTime;
 		uint64_t lastUpdateTime;   // realtime ms of the last command that passed the drop gates
+		uint64_t invalidBurstMs;   // realtime ms of the last invalid interval (its same-frame burst is invalid too)
 		uint64_t rateWallMs;       // wall time accumulated over accepted short intervals
 		uint64_t rateMsecMs;       // client time accumulated over the same intervals
 		uint64_t totalMsec;        // every msec since connect (diagnostics)
