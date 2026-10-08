@@ -108,7 +108,7 @@ This means that plugins that do binary code analysis (Orpheu for example) probab
 <li>sv_rehlds_movecmdtime_max_warnings // Maximum allowed speedhack/slowmo warnings before the punishment is applied. -1 - no punishment, but detection keeps dropping commands of measured cheaters. Default: -1
 <li>sv_rehlds_movecmdtime_gap_reset // Client silence intervals longer than this (seconds) are excluded from the speed measurement: AFK, minimized game and level load are not slowmo evidence. 0 - disables speed measurement entirely (no interval is ever valid). Default: 0.5
 <li>sv_rehlds_movecmdtime_punish // Time in minutes for which the player will be banned for speedhacking/slowing (-1 - Kick, 0 - Permanent, use a negative number for a kick). Default: -1
-<li>sv_rehlds_movecmdtime_debug // Writes movecmdtime telemetry (events + per-client state dumps every 10s) to logs/movecmdtime_debug.log. 0 - off, 1 - events and state dumps, 2 - also log every dropped command batch. Works regardless of sv_rehlds_movecmdtime_max_warnings. Default: 0
+<li>sv_rehlds_movecmdtime_debug // Writes movecmdtime telemetry (events + per-client state dumps and server frame-time/network-loss stats every 10s) to logs/movecmdtime_debug.log. 0 - off, 1 - events and state dumps, 2 - also log every dropped command batch. Works regardless of sv_rehlds_movecmdtime_max_warnings. Default: 0
 <li>sv_reconnect_timeout // Hard deadline in seconds for a client to re-initiate its connection after a level change, independent of netchan activity. Closes a phantom-slot exploit where a cheat blocks the "reconnect" command and keeps the netchan warm so sv_timeout never fires. 0 - disabled. Default: 30
 </ul>
 </details>

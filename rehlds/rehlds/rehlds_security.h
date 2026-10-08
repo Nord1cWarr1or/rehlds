@@ -72,6 +72,7 @@ public:
 	// telemetry hooks
 	void OnClockWindowSet(unsigned int clientId, double dif);
 	void OnCmdSkippedByClockWindow(unsigned int clientId);
+	void OnMoveParsed(unsigned int clientId, int netDrop, int numBackup);
 
 private:
 
@@ -133,6 +134,8 @@ private:
 		unsigned int cwSkippedCmds;     // cmds skipped during current/last clockwindow window
 		unsigned int cwSkippedTotal;    // total cmds skipped by clockwindow since connect
 		bool cwActive;                  // inside (or just left) a clockwindow ignore window
+		unsigned int replayedCmds;      // lost cmds replayed from lastcmd (bypass CheckLimits)
+		unsigned int lostCmds;          // lost cmds not run at all (net_drop >= 24)
 		double nextDumpTime;
 		double lastWarnLogTime;
 		double lastDropLogTime;

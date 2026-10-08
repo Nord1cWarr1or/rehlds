@@ -341,6 +341,25 @@ static double g_lastFrameRealtime = -1.0;
 static double g_stallUntil = 0.0;
 static double g_lastStallLogTime = 0.0;
 
+// server health telemetry, one SERVER line per SERVER_STATS_PERIOD: frame
+// time distribution (stalls below sv_rehlds_movecmdtime_stall_threshold are
+// visible here) and movement commands lost on the network across all clients
+#define SERVER_STATS_PERIOD 10.0
+
+struct mcmd_server_stats_t {
+	unsigned int frames;
+	double maxFrameDelta;
+	unsigned int frames50;    // frames longer than 50ms
+	unsigned int frames100;   // frames longer than 100ms
+	unsigned int framesStall; // frames longer than the stall threshold
+	unsigned int dropPackets; // packets that arrived after unrecoverable cmd loss
+	unsigned int replayedCmds;
+	unsigned int lostCmds;
+};
+
+static mcmd_server_stats_t g_serverStats;
+static double g_nextServerStatsTime = 0.0;
+
 void CUserCmdTimeLimiter::PushRatePoint(usercmd_state_t *ust, double at, const char *name)
 {
 	// a long command silence makes the stored window stale: restart it
@@ -731,7 +750,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 
 	// clockRate drifts permanently after speedhack sessions (reported msec
 	// cannot be unreported) - rate above is the live metric
-	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u msec=%llums age=%.0fs",
+	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u) msec=%llums age=%.0fs",
 		cl->name,
 		rate, winSec, clockRate,
 		ust->avgMsec,
@@ -744,6 +763,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		ust->stallImmuneSkipped,
 		ust->cwCount, ust->cwSkippedTotal,
 		ust->rateRestarts,
+		ust->replayedCmds, ust->lostCmds,
 		(unsigned long long)ust->totalMsec,
 		elapsedMs / 1000.0);
 }
@@ -769,6 +789,56 @@ void CUserCmdTimeLimiter::OnCmdSkippedByClockWindow(unsigned int clientId)
 	ust->cwActive = true;
 	ust->cwSkippedCmds++;
 	ust->cwSkippedTotal++;
+}
+
+void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int numBackup)
+{
+	// mirrors the run logic of SV_ParseMove: up to numBackup lost cmds are
+	// recovered from the packet backup (they pass CheckLimits), the rest are
+	// replayed from lastcmd, and with netDrop >= 24 nothing is run at all
+	if (netDrop <= numBackup) {
+		return;
+	}
+
+	usercmd_state_t *ust = &m_States[clientId];
+	unsigned int missing = (unsigned int)(netDrop - numBackup);
+
+	if (netDrop < 24) {
+		ust->replayedCmds += missing;
+		g_serverStats.replayedCmds += missing;
+	} else {
+		ust->lostCmds += missing;
+		g_serverStats.lostCmds += missing;
+	}
+
+	g_serverStats.dropPackets++;
+}
+
+static void ServerStatsFrame(double frameDelta)
+{
+	mcmd_server_stats_t *st = &g_serverStats;
+
+	st->frames++;
+	if (frameDelta > st->maxFrameDelta) st->maxFrameDelta = frameDelta;
+	if (frameDelta > 0.05) st->frames50++;
+	if (frameDelta > 0.1) st->frames100++;
+	if (sv_rehlds_movecmdtime_stall_threshold.value > 0.0f
+		&& frameDelta > sv_rehlds_movecmdtime_stall_threshold.value) {
+		st->framesStall++;
+	}
+
+	if (realtime < g_nextServerStatsTime) {
+		return;
+	}
+
+	if (g_nextServerStatsTime > 0.0 && sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+		MCmd_Log("SERVER frames=%u maxFrame=%.3fs f50=%u f100=%u fstall=%u dropPkts=%u replayed=%u lost=%u",
+			st->frames, st->maxFrameDelta, st->frames50, st->frames100, st->framesStall,
+			st->dropPackets, st->replayedCmds, st->lostCmds);
+	}
+
+	Q_memset(st, 0, sizeof(*st));
+	g_nextServerStatsTime = realtime + SERVER_STATS_PERIOD;
 }
 
 void Rehlds_Security_Init() {
@@ -828,6 +898,8 @@ void Rehlds_Security_Frame() {
 				frameDelta, sv_rehlds_movecmdtime_stall_grace.value);
 		}
 	}
+
+	ServerStatsFrame(frameDelta);
 
 	g_MoveCommandRateLimiter.Frame();
 	g_StringCommandsRateLimiter.Frame();
