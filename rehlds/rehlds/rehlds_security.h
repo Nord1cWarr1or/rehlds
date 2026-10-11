@@ -69,10 +69,26 @@ public:
 	bool CheckLimits(unsigned int clientId, usercmd_t *ucmd);
 	void ClientConnected(unsigned int clientId);
 
+	// SV_ParseMove: sequence is the netchan sequence of the move packet,
+	// netDrop/numBackup are the engine's lost-command bookkeeping for it
+	void OnMoveParsed(unsigned int clientId, int sequence, int netDrop, int numBackup);
+
 	// telemetry hooks
 	void OnClockWindowSet(unsigned int clientId, double dif);
 	void OnCmdSkippedByClockWindow(unsigned int clientId);
-	void OnMoveParsed(unsigned int clientId, int netDrop, int numBackup);
+
+	// read-only view of the measurement state (diagnostics, unit tests)
+	struct measure_info_t {
+		double rate;               // client speed over the sliding window, 0 - window not ready
+		double winSec;             // real time the window covers
+		unsigned int detectSpeed;  // commands judged as speedhack
+		unsigned int detectSlow;   // commands judged as slowmo
+		unsigned int budgetClamps;
+		unsigned int lostPackets;  // client packets lost on the way (netchan sequence gaps)
+		uint64_t exclGapMs;        // real time kept out of the window: client silence
+		uint64_t exclLossMs;       // real time kept out of the window: lost client packets
+	};
+	void GetMeasureInfo(unsigned int clientId, measure_info_t *info) const;
 
 private:
 
@@ -90,10 +106,15 @@ private:
 		ABUSE_MAX
 	};
 
+	// why the current excluded span started
+	enum ExclReason {
+		EXCL_GAP,   // client silence longer than gap_reset (or the first command)
+		EXCL_LOSS   // client packets lost on the way to the server
+	};
+
 	struct rate_point_t {
 		uint64_t wallMs;   // running wall total at sampling moment
 		uint64_t msecMs;   // running client-time total at sampling moment
-		double at;         // realtime seconds (stale-window detection)
 	};
 
 	struct usercmd_state_t {
@@ -104,7 +125,6 @@ private:
 		// time accounting (accepted commands only)
 		uint64_t joinTime;
 		uint64_t lastUpdateTime;   // realtime ms of the last command that passed the drop gates
-		uint64_t invalidBurstMs;   // realtime ms of the last invalid interval (its same-frame burst is invalid too)
 		uint64_t rateWallMs;       // wall time accumulated over accepted short intervals
 		uint64_t rateMsecMs;       // client time accumulated over the same intervals
 		uint64_t totalMsec;        // every msec since connect (diagnostics)
@@ -116,6 +136,17 @@ private:
 		int ratePointCount;
 		unsigned int rateRestarts; // window restarts after long silence
 		uint64_t pendingDroppedMsec; // time of max_ticks-dropped cmds, added to the window with the next accepted interval
+
+		// excluded intervals: an interval that cannot be measured (long
+		// silence, lost packets) is kept out of the window together with the
+		// rest of its frame and, for a silence, the client time that
+		// arrives late for it
+		uint64_t exclFrameMs;      // realtime ms of the frame the last excluded interval opened
+		ExclReason exclFrameReason;
+		uint64_t exclDebtMs;       // client time still expected for an excluded silence
+		uint64_t exclDebtSinceMs;  // realtime ms the silence debt was last added
+		bool lossPending;          // a packet arrived after lost ones, its commands are not judged
+		int lastMoveSeq;           // netchan sequence of the last move packet, 0 - none yet
 
 		// punishment state
 		unsigned int warnings[ABUSE_MAX];
@@ -129,13 +160,18 @@ private:
 		unsigned int interpDrops;       // cmds dropped by sv_rehlds_movecmd_clamp_interp
 		unsigned int budgetClamps;      // commands clipped by the movement-time budget
 		unsigned int stallImmuneSkipped; // slowmo warnings not accrued because a server stall was detected
-		unsigned int abuseDrops[ABUSE_MAX]; // cmds dropped by abuse detection
+		unsigned int abuseDrops[ABUSE_MAX]; // cmds dropped by abuse detection (speedhack only)
 		unsigned int cwCount;           // vanilla clockwindow ignore windows set on this client
 		unsigned int cwSkippedCmds;     // cmds skipped during current/last clockwindow window
 		unsigned int cwSkippedTotal;    // total cmds skipped by clockwindow since connect
 		bool cwActive;                  // inside (or just left) a clockwindow ignore window
 		unsigned int replayedCmds;      // lost cmds replayed from lastcmd (bypass CheckLimits)
 		unsigned int lostCmds;          // lost cmds not run at all (net_drop >= 24)
+		unsigned int lostPackets;       // client packets lost on the way (netchan sequence gaps)
+		uint64_t exclGapMs;             // real time excluded from the window: client silence
+		uint64_t exclLossMs;            // real time excluded from the window: lost packets
+		uint64_t dumpExclLossMs;        // exclLossMs at the previous state dump
+		double lastDumpTime;
 		double nextDumpTime;
 		double lastWarnLogTime;
 		double lastDropLogTime;
@@ -144,7 +180,8 @@ private:
 	usercmd_state_t m_States[MAX_CLIENTS];
 
 private:
-	void PushRatePoint(usercmd_state_t *ust, double at, const char *name);
+	void PushRatePoint(usercmd_state_t *ust);
+	static bool WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec);
 };
 
 extern CUserCmdTimeLimiter g_UserCmdTimeLimiter;

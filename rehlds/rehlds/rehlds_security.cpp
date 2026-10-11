@@ -331,6 +331,8 @@ void CUserCmdTimeLimiter::ClientConnected(unsigned int clientId)
 #define RATE_WARN_ACCRUE_MS  10000   // one warning accrual per this ms inside an episode
 #define RATE_STABLE_DECAY_MS 60000   // in-range speed time that forgives one warning
 #define BUDGET_REFILL_TOLERANCE 1.02 // budget refill speed relative to real time (client clock drift)
+#define RATE_EXCL_DEBT_AGE_MS 1000   // late client time for an excluded span is awaited this long at most
+#define LOSS_HEAVY_SHARE      0.8    // telemetry: share of a dump period excluded for packet loss that is logged
 
 // server stall state: a host frame longer than sv_rehlds_movecmdtime_stall_threshold
 // means the server could not process client commands (freeze, map load, background
@@ -355,24 +357,14 @@ struct mcmd_server_stats_t {
 	unsigned int dropPackets; // packets that arrived after unrecoverable cmd loss
 	unsigned int replayedCmds;
 	unsigned int lostCmds;
+	unsigned int lostPackets; // client packets lost on the way (netchan sequence gaps)
 };
 
 static mcmd_server_stats_t g_serverStats;
 static double g_nextServerStatsTime = 0.0;
 
-void CUserCmdTimeLimiter::PushRatePoint(usercmd_state_t *ust, double at, const char *name)
+void CUserCmdTimeLimiter::PushRatePoint(usercmd_state_t *ust)
 {
-	// a long command silence makes the stored window stale: restart it
-	if (ust->ratePointCount > 0
-		&& at - ust->ratePoints[ust->ratePointCount - 1].at > RATE_PAUSE_RESET_MS / 1000.0)
-	{
-		ust->ratePointCount = 0;
-		ust->rateRestarts++;
-		if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
-			MCmd_Log("RATE-RESTART name=%s (window stale after silence)", name);
-		}
-	}
-
 	if (ust->ratePointCount == RATE_POINTS_MAX) {
 		memmove(&ust->ratePoints[0], &ust->ratePoints[1], sizeof(rate_point_t) * (RATE_POINTS_MAX - 1));
 		ust->ratePointCount--;
@@ -380,7 +372,6 @@ void CUserCmdTimeLimiter::PushRatePoint(usercmd_state_t *ust, double at, const c
 
 	ust->ratePoints[ust->ratePointCount].wallMs = ust->rateWallMs;
 	ust->ratePoints[ust->ratePointCount].msecMs = ust->rateMsecMs;
-	ust->ratePoints[ust->ratePointCount].at = at;
 	ust->ratePointCount++;
 }
 
@@ -493,25 +484,78 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	}
 
 	// Wall time between accepted commands counts towards the speed window
-	// only when shorter than sv_rehlds_movecmdtime_gap_reset - long
-	// silences mean the client was not playing.
+	// only when the client time for it is known to have arrived. Two cases
+	// break that and start an excluded span:
+	// - a silence longer than sv_rehlds_movecmdtime_gap_reset: the client
+	//   was not playing (AFK, minimized, loading) or held its commands back
+	// - lost client packets: their commands are replayed from lastcmd or
+	//   not run at all, so their time never reaches this check
 	uint64_t gapMs = (ust->lastUpdateTime != 0 && now > ust->lastUpdateTime) ? (now - ust->lastUpdateTime) : 0;
-	bool intervalValid = (ust->lastUpdateTime != 0
-		&& sv_rehlds_movecmdtime_gap_reset.value > 0.0f
-		&& gapMs <= (uint64_t)(sv_rehlds_movecmdtime_gap_reset.value * 1000.0f));
+	bool firstCmd = (ust->lastUpdateTime == 0);
+	bool gapTooLong = (sv_rehlds_movecmdtime_gap_reset.value <= 0.0f
+		|| gapMs > (uint64_t)(sv_rehlds_movecmdtime_gap_reset.value * 1000.0f));
+	bool afterLoss = ust->lossPending;
+	ust->lossPending = false;
 
-	// The commands a client held during a long silence arrive as one burst
-	// processed in a single frame: only the first one sees the long gap, the
-	// rest see a zero gap. The whole burst belongs to the silence - counting
-	// its msec against zero wall time would inflate the measured speed of
-	// clients that choke or lag.
-	if (!intervalValid) {
-		ust->invalidBurstMs = now;
-	} else if (gapMs == 0 && now == ust->invalidBurstMs) {
-		intervalValid = false;
+	// A long command silence makes the stored window stale: restart it.
+	// The client's own silence decides, not how long the window took to
+	// fill - under heavy packet loss most intervals are excluded and the
+	// window fills slowly, yet everything in it is still valid.
+	if (!firstCmd && gapMs > RATE_PAUSE_RESET_MS && ust->ratePointCount > 0)
+	{
+		ust->ratePointCount = 0;
+		ust->rateRestarts++;
+		if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+			MCmd_Log("RATE-RESTART name=%s silence=%.1fs (window stale)", cl->name, gapMs / 1000.0);
+		}
 	}
 
-	bool firstCmd = (ust->lastUpdateTime == 0);
+	bool debtOpen = (ust->exclDebtMs > 0 && now - ust->exclDebtSinceMs <= RATE_EXCL_DEBT_AGE_MS);
+	if (!debtOpen) {
+		ust->exclDebtMs = 0;
+	}
+
+	bool intervalValid;
+	ExclReason reason;
+	if (firstCmd || gapTooLong)
+	{
+		// A held client delivers the time of a silence late, as a command
+		// burst (often spread over several frames and trimmed by max_ticks).
+		// That burst belongs to the silence: counted against the short gaps
+		// it arrives with, it would inflate the measured speed. The silence
+		// stays excluded until the client time covering it has arrived, or
+		// RATE_EXCL_DEBT_AGE_MS has passed (an AFK client that comes back
+		// has no backlog to deliver).
+		intervalValid = false;
+		reason = EXCL_GAP;
+		ust->exclDebtMs += gapMs;
+		ust->exclDebtSinceMs = now;
+		ust->exclFrameMs = now;
+		ust->exclFrameReason = reason;
+	}
+	else if (afterLoss)
+	{
+		// The time of lost packets never arrives - nothing to wait for. The
+		// packet that came after them is excluded as a whole (its backups
+		// cover only part of the loss), the stream after it is measured.
+		intervalValid = false;
+		reason = EXCL_LOSS;
+		ust->exclFrameMs = now;
+		ust->exclFrameReason = reason;
+	}
+	else if (now == ust->exclFrameMs)
+	{
+		// the rest of the frame (the packet, a burst) belongs to the excluded
+		// interval that opened it, even with no client time to wait for
+		intervalValid = false;
+		reason = ust->exclFrameReason;
+	}
+	else
+	{
+		intervalValid = !debtOpen;
+		reason = EXCL_GAP;
+	}
+
 	if (firstCmd) {
 		ust->joinTime = now;
 	}
@@ -525,9 +569,17 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		ust->pendingDroppedMsec = 0;
 	}
 	else {
-		// invalid interval: its wall time stays out of the window, so the
-		// parked msec of commands dropped over it must stay out too
+		// the excluded command and the parked msec of commands dropped
+		// over the interval pay back the time a silence is waiting for
+		uint64_t delivered = ucmd->msec + ust->pendingDroppedMsec;
+		ust->exclDebtMs = (delivered >= ust->exclDebtMs) ? 0 : (ust->exclDebtMs - delivered);
 		ust->pendingDroppedMsec = 0;
+
+		if (reason == EXCL_LOSS) {
+			ust->exclLossMs += gapMs;
+		} else {
+			ust->exclGapMs += gapMs;
+		}
 	}
 
 	// Movement-time budget: the allowance refills with real wall time (up
@@ -563,12 +615,11 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	ust->avgMsec = (ust->avgMsec == 0.0) ? (double)ucmd->msec : ust->avgMsec * 0.95 + ucmd->msec * 0.05;
 
-	// sample a control point every RATE_POINT_STEP_MS of wall progress;
-	// a pause longer than RATE_PAUSE_RESET_MS makes the stored window stale
+	// sample a control point every RATE_POINT_STEP_MS of measured wall time
 	if (ust->ratePointCount == 0
 		|| ust->rateWallMs - ust->ratePoints[ust->ratePointCount - 1].wallMs >= RATE_POINT_STEP_MS)
 	{
-		PushRatePoint(ust, realtime, cl->name);
+		PushRatePoint(ust);
 	}
 
 	// measure the client's game-time speed over the sliding window
@@ -576,12 +627,9 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	double rate = 0.0;
 	double winSec = 0.0;
 
-	if (ust->ratePointCount >= 2)
+	uint64_t dWall, dMsec;
+	if (WindowTotals(ust, &dWall, &dMsec))
 	{
-		const rate_point_t *first = &ust->ratePoints[0];
-		const rate_point_t *last = &ust->ratePoints[ust->ratePointCount - 1];
-		uint64_t dWall = last->wallMs - first->wallMs;
-		uint64_t dMsec = last->msecMs - first->msecMs;
 		winSec = dWall / 1000.0;
 
 		// need enough real time for smoothing and enough reported client
@@ -601,15 +649,14 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	if (abuseType != ABUSE_NONE)
 	{
 		// counted even when punishment is disabled, for telemetry
-		ust->abuseDrops[(int)abuseType]++;
 		ust->telemWarn[(int)abuseType]++;
 
 		// stall immunity: while the grace period lasts, slowmo detections
-		// are the server's fault - telemetry keeps counting, commands keep
-		// dropping, no warnings accrue. The check covers both the confirmed
-		// grace and the live frame delta: a burst right after the stall is
-		// processed before the end-of-frame check would extend the grace.
-		// A speedhack is a client-side property and is never covered.
+		// are the server's fault - telemetry keeps counting, no warnings
+		// accrue. The check covers both the confirmed grace and the live
+		// frame delta: a burst right after the stall is processed before
+		// the end-of-frame check would extend the grace. A speedhack is a
+		// client-side property and is never covered.
 		bool stallImmune = (abuseType == ABUSE_SLOWMO
 			&& (realtime < g_stallUntil
 				|| (sv_rehlds_movecmdtime_stall_threshold.value > 0.0f
@@ -671,10 +718,24 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 			}
 		}
 
-		// drop commands while the episode lasts: the client keeps gaining
-		// speed it did not play through
 		ust->stableSinceMs = 0;
-		return true;
+
+		// a punished client is gone, its command must not run
+		if (!cl->connected) {
+			return true;
+		}
+
+		// A measured speedhack loses its commands while the episode lasts:
+		// the client keeps gaining speed it did not play through. A measured
+		// slowdown is only judged, its commands still run - a slow client
+		// gains nothing from them, and an innocent one (bad network the
+		// window could not see) would be frozen in place.
+		if (abuseType == ABUSE_SPEEDHACK) {
+			ust->abuseDrops[ABUSE_SPEEDHACK]++;
+			return true;
+		}
+
+		return false;
 	}
 	else
 	{
@@ -703,12 +764,27 @@ void CUserCmdTimeLimiter::Frame()
 		m_States[i].ticksThisFrame = 0;
 	}
 
+	if (!g_psvs.clients) {
+		return;
+	}
+
+	unsigned int numClients = (g_psvs.maxclientslimit < MAX_CLIENTS) ? (unsigned int)g_psvs.maxclientslimit : MAX_CLIENTS;
+
+	// an inactive client (signon after a level change) sends packets that
+	// carry no moves - its sequence moves on without any loss, so the next
+	// move packet starts the sequence tracking anew
+	for (unsigned int i = 0; i < numClients; i++) {
+		if (!g_psvs.clients[i].active) {
+			m_States[i].lastMoveSeq = 0;
+		}
+	}
+
 	if (sv_rehlds_movecmdtime_debug.value < 1.0f) {
 		return;
 	}
 
 	// periodic per-client state dump, one line every 10 seconds
-	for (unsigned int i = 0; i < MAX_CLIENTS; i++)
+	for (unsigned int i = 0; i < numClients; i++)
 	{
 		client_t *cl = &g_psvs.clients[i];
 		if (!cl->connected || cl->fakeclient) {
@@ -731,28 +807,29 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 	uint64_t now = (uint64_t)(realtime * 1000.0);
 
 	// current measured speed over the sliding window (0 = window not ready)
-	double rate = 0.0;
-	double winSec = 0.0;
-	if (ust->ratePointCount >= 2)
-	{
-		const rate_point_t *first = &ust->ratePoints[0];
-		const rate_point_t *last = &ust->ratePoints[ust->ratePointCount - 1];
-		uint64_t dWall = last->wallMs - first->wallMs;
-		uint64_t dMsec = last->msecMs - first->msecMs;
-		winSec = dWall / 1000.0;
-		if (dWall > 0) {
-			rate = (double)dMsec / (double)dWall;
-		}
-	}
+	measure_info_t info;
+	GetMeasureInfo(clientId, &info);
 
 	uint64_t elapsedMs = (ust->joinTime != 0 && now > ust->joinTime) ? (now - ust->joinTime) : 0;
 	double clockRate = (elapsedMs > 0) ? ((double)ust->totalMsec / (double)elapsedMs) : 0.0;
 
+	// a client whose packets are lost most of the time cannot be measured:
+	// a real network episode passes in a minute or two, a client faking
+	// lost packets to hide a slowdown shows up here for its whole session
+	double periodSec = (ust->lastDumpTime > 0.0) ? (realtime - ust->lastDumpTime) : 0.0;
+	uint64_t periodLossMs = ust->exclLossMs - ust->dumpExclLossMs;
+	if (periodSec >= 5.0 && periodLossMs >= periodSec * 1000.0 * LOSS_HEAVY_SHARE) {
+		MCmd_Log("LOSS-HEAVY name=%s excluded=%.1fs/%.1fs pktLost=%u (speed not measurable while packets are lost)",
+			cl->name, periodLossMs / 1000.0, periodSec, ust->lostPackets);
+	}
+	ust->lastDumpTime = realtime;
+	ust->dumpExclLossMs = ust->exclLossMs;
+
 	// clockRate drifts permanently after speedhack sessions (reported msec
 	// cannot be unreported) - rate above is the live metric
-	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u) msec=%llums age=%.0fs",
+	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u p:%u) excl=(g:%.0fs l:%.0fs) msec=%llums age=%.0fs",
 		cl->name,
-		rate, winSec, clockRate,
+		info.rate, info.winSec, clockRate,
 		ust->avgMsec,
 		(ust->avgMsec > 0.0) ? (1000.0 / ust->avgMsec) : 0.0,
 		(unsigned int)cl->packet_loss,
@@ -763,9 +840,42 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		ust->stallImmuneSkipped,
 		ust->cwCount, ust->cwSkippedTotal,
 		ust->rateRestarts,
-		ust->replayedCmds, ust->lostCmds,
+		ust->replayedCmds, ust->lostCmds, ust->lostPackets,
+		ust->exclGapMs / 1000.0, ust->exclLossMs / 1000.0,
 		(unsigned long long)ust->totalMsec,
 		elapsedMs / 1000.0);
+}
+
+bool CUserCmdTimeLimiter::WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec)
+{
+	if (ust->ratePointCount < 2) {
+		return false;
+	}
+
+	const rate_point_t *first = &ust->ratePoints[0];
+	const rate_point_t *last = &ust->ratePoints[ust->ratePointCount - 1];
+	*dWall = last->wallMs - first->wallMs;
+	*dMsec = last->msecMs - first->msecMs;
+	return true;
+}
+
+void CUserCmdTimeLimiter::GetMeasureInfo(unsigned int clientId, measure_info_t *info) const
+{
+	const usercmd_state_t *ust = &m_States[clientId];
+	uint64_t dWall, dMsec;
+
+	Q_memset(info, 0, sizeof(*info));
+	if (WindowTotals(ust, &dWall, &dMsec) && dWall > 0) {
+		info->rate = (double)dMsec / (double)dWall;
+		info->winSec = dWall / 1000.0;
+	}
+
+	info->detectSpeed = ust->telemWarn[ABUSE_SPEEDHACK];
+	info->detectSlow = ust->telemWarn[ABUSE_SLOWMO];
+	info->budgetClamps = ust->budgetClamps;
+	info->lostPackets = ust->lostPackets;
+	info->exclGapMs = ust->exclGapMs;
+	info->exclLossMs = ust->exclLossMs;
 }
 
 void CUserCmdTimeLimiter::OnClockWindowSet(unsigned int clientId, double dif)
@@ -791,16 +901,34 @@ void CUserCmdTimeLimiter::OnCmdSkippedByClockWindow(unsigned int clientId)
 	ust->cwSkippedTotal++;
 }
 
-void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int numBackup)
+void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int sequence, int netDrop, int numBackup)
 {
-	// mirrors the run logic of SV_ParseMove: up to numBackup lost cmds are
-	// recovered from the packet backup (they pass CheckLimits), the rest are
-	// replayed from lastcmd, and with netDrop >= 24 nothing is run at all
+	usercmd_state_t *ust = &m_States[clientId];
+
+	// An in-game client sends its moves with every packet, so a sequence
+	// gap between two move packets means packets (and their commands) were
+	// lost. The engine's net_drop misses most of these: it is reduced by
+	// the number of new commands in the packet, and with several commands
+	// per packet (fps above cl_cmdrate, the usual case) a lost packet
+	// leaves it at zero or below. Packets the server rejected after the
+	// netchan accepted them (bogus move data) show up here as well - their
+	// commands did not run either. A rare packet without a move only costs
+	// one interval kept out of the measurement.
+	if (ust->lastMoveSeq != 0 && sequence - ust->lastMoveSeq > 1) {
+		unsigned int lostPackets = (unsigned int)(sequence - ust->lastMoveSeq - 1);
+		ust->lostPackets += lostPackets;
+		g_serverStats.lostPackets += lostPackets;
+		ust->lossPending = true;
+	}
+	ust->lastMoveSeq = sequence;
+
+	// telemetry, mirrors the run logic of SV_ParseMove: up to numBackup lost
+	// cmds are recovered from the packet backup (they pass CheckLimits), the
+	// rest are replayed from lastcmd, and with netDrop >= 24 nothing is run
 	if (netDrop <= numBackup) {
 		return;
 	}
 
-	usercmd_state_t *ust = &m_States[clientId];
 	unsigned int missing = (unsigned int)(netDrop - numBackup);
 
 	if (netDrop < 24) {
@@ -832,9 +960,9 @@ static void ServerStatsFrame(double frameDelta)
 	}
 
 	if (g_nextServerStatsTime > 0.0 && sv_rehlds_movecmdtime_debug.value >= 1.0f) {
-		MCmd_Log("SERVER frames=%u maxFrame=%.3fs f50=%u f100=%u fstall=%u dropPkts=%u replayed=%u lost=%u",
+		MCmd_Log("SERVER frames=%u maxFrame=%.3fs f50=%u f100=%u fstall=%u dropPkts=%u replayed=%u lost=%u pktLost=%u",
 			st->frames, st->maxFrameDelta, st->frames50, st->frames100, st->framesStall,
-			st->dropPackets, st->replayedCmds, st->lostCmds);
+			st->dropPackets, st->replayedCmds, st->lostCmds, st->lostPackets);
 	}
 
 	Q_memset(st, 0, sizeof(*st));

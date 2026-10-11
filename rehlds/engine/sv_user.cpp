@@ -1721,9 +1721,10 @@ void SV_ParseMove(client_t *pSenderClient)
 #endif
 
 #ifdef REHLDS_FIXES
-	// telemetry: commands lost beyond the backup are replayed from lastcmd
-	// (or not run at all) without passing CUserCmdTimeLimiter::CheckLimits
-	g_UserCmdTimeLimiter.OnMoveParsed(host_client - g_psvs.clients, net_drop, numbackup);
+	// commands lost beyond the backup are replayed from lastcmd (or not run
+	// at all) without passing CUserCmdTimeLimiter::CheckLimits; the netchan
+	// sequence shows every lost packet, including those net_drop misses
+	g_UserCmdTimeLimiter.OnMoveParsed(host_client - g_psvs.clients, host_client->netchan.incoming_sequence, net_drop, numbackup);
 #endif
 
 	SV_EstablishTimeBase(host_client, cmds, net_drop, numbackup, numcmds);
