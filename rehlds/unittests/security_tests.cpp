@@ -63,10 +63,13 @@ TEST(IsSafeFileExtension, SecurityChecks, 1000)
 // movecmdtime detector simulation: one client plays against
 // CUserCmdTimeLimiter. The client runs frames at a fixed fps and reports
 // msec scaled by its game speed, sends a packet every few frames (new
-// commands + 2 backups); the network may lose or hold packets. The server
-// advances to every packet arrival (1ms frames) and processes the packet
-// the way SV_ParseMove + SV_RunCmd do: backups run through CheckLimits,
-// commands lost beyond them are replayed from lastcmd without it.
+// commands + 2 backups); the network may lose or hold packets. Like the
+// GoldSrc client (CL_Move), every command takes a netchan sequence number,
+// a held-back one too, so a packet's sequence moves on by its command
+// count. The server advances to every packet arrival (1ms frames) and
+// processes the packet the way SV_ParseMove + SV_RunCmd do: net_drop is
+// the sequence gap less the held-back commands, backups run through
+// CheckLimits, commands lost beyond them are replayed from lastcmd without it.
 
 struct movesim_params_t
 {
@@ -75,7 +78,7 @@ struct movesim_params_t
 	int cmdsPerPacket;
 	double speed;              // game-time scale the client reports
 	unsigned int lossPermille; // random packet loss
-	bool fakeLoss;             // client skips a sequence number on every packet
+	int fakeSkip;              // extra sequence numbers the client skips before every packet
 
 	// network outage: every outageEvery seconds packets are lost for outageLen
 	double outageEvery;
@@ -91,7 +94,8 @@ struct movesim_params_t
 	double silenceAt;
 	double silenceLen;
 
-	// level change: the client is inactive, its signon packets carry no moves
+	// level change: the client is inactive, its signon packets carry no
+	// moves but take sequence numbers the server's netchan does see
 	double levelChangeAt;
 	double levelChangeLen;
 	int signonPackets;
@@ -108,7 +112,7 @@ struct movesim_packet_t
 {
 	int seq;
 	int numCmds;
-	byte msec[16];
+	byte msec[32];
 	byte backup[2]; // [0] older, [1] newer
 };
 
@@ -149,12 +153,13 @@ static void MoveSim_Deliver(const movesim_packet_t *pkt, double atSec, int *last
 		g_UserCmdTimeLimiter.Frame();
 	}
 
-	int lostBefore = (*lastSeq != 0) ? (pkt->seq - *lastSeq - 1) : 0;
+	int seqGap = (*lastSeq != 0) ? (pkt->seq - *lastSeq - 1) : 0;
 	*lastSeq = pkt->seq;
 
-	// SV_ParseMove bookkeeping
-	int netDrop = lostBefore + 1 - pkt->numCmds;
-	g_UserCmdTimeLimiter.OnMoveParsed(0, pkt->seq, netDrop, 2);
+	// SV_ParseMove bookkeeping: the held-back commands of this packet are
+	// not lost, only what is left of the gap is
+	int netDrop = seqGap + 1 - pkt->numCmds;
+	g_UserCmdTimeLimiter.OnMoveParsed(0, netDrop, 2);
 
 	if (netDrop > 0 && netDrop < 24) {
 		int backups = (netDrop < 2) ? netDrop : 2;
@@ -223,6 +228,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 		if (inLevelChange) {
 			inLevelChange = false;
 			seq += p->signonPackets;
+			lastSeq = seq;
 			s_simClients[0].active = TRUE;
 		}
 
@@ -240,7 +246,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 			continue;
 		}
 
-		seq += p->fakeLoss ? 2 : 1;
+		seq += pkt.numCmds + p->fakeSkip;
 		pkt.seq = seq;
 		pkt.backup[0] = prev[0];
 		pkt.backup[1] = prev[1];
@@ -284,9 +290,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 static void MoveSim_Check(const char *what, bool cond, const movesim_result_t *res)
 {
 	char msg[512];
-	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u lostPkts=%u exclGap=%llums exclLoss=%llums)",
+	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u exclGap=%llums exclLoss=%llums)",
 		what, res->info.rate, res->info.winSec, res->info.detectSlow, res->info.detectSpeed,
-		res->info.budgetClamps, res->dropped, res->judged, res->info.lostPackets,
+		res->info.budgetClamps, res->dropped, res->judged,
 		(unsigned long long)res->info.exclGapMs, (unsigned long long)res->info.exclLossMs);
 	CHECK(msg, cond);
 }
@@ -303,6 +309,49 @@ TEST(MoveCmdTimeHonestClient, MoveCmdTime, 5000)
 	MoveSim_Check("honest client keeps every command", res.dropped == 0 && res.info.budgetClamps == 0, &res);
 }
 
+// fps above cl_cmdrate: every packet carries several commands and its
+// sequence jumps over the held-back ones - that is not packet loss (the
+// whole window used to be excluded for such clients)
+TEST(MoveCmdTimeHighFpsHonest, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.fps = 300;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("high fps client is measured at real speed", res.info.rate > 0.98 && res.info.rate < 1.02, &res);
+	MoveSim_Check("high fps client is measured over the full window", res.info.winSec >= 50.0, &res);
+	MoveSim_Check("held-back commands are not loss", res.info.exclLossMs == 0, &res);
+	MoveSim_Check("high fps client is never judged", res.info.detectSlow == 0 && res.info.detectSpeed == 0, &res);
+}
+
+TEST(MoveCmdTimeHighFpsSlowmo, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.fps = 300;
+	p.speed = 0.4;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("high fps slowmo x0.4 is measured", res.info.rate > 0.38 && res.info.rate < 0.42, &res);
+	MoveSim_Check("high fps slowmo x0.4 is detected", res.info.detectSlow > 0, &res);
+}
+
+TEST(MoveCmdTimeHighFpsSpeedhack, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.fps = 300;
+	p.speed = 4.0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("high fps speedhack x4 is clipped by the budget", res.info.budgetClamps > 0, &res);
+	MoveSim_Check("high fps speedhack x4 is detected", res.info.detectSpeed > 0, &res);
+}
+
 // Short network outages (shorter than gap_reset) lose whole packets: their
 // time never reaches the detector, the window used to measure 0.7 here.
 TEST(MoveCmdTimeShortOutages, MoveCmdTime, 5000)
@@ -315,7 +364,7 @@ TEST(MoveCmdTimeShortOutages, MoveCmdTime, 5000)
 	p.outageLen = 0.3;
 	MoveSim_Run(&p, &res);
 
-	MoveSim_Check("outages are seen as lost packets", res.info.lostPackets > 0 && res.info.exclLossMs > 0, &res);
+	MoveSim_Check("outages are seen as lost commands", res.info.exclLossMs > 0, &res);
 	MoveSim_Check("outages are not slowmo", res.info.detectSlow == 0, &res);
 	MoveSim_Check("speed between outages is measured and real", res.info.winSec >= 15.0 && res.info.rate > 0.95 && res.info.rate < 1.05, &res);
 }
@@ -367,7 +416,7 @@ TEST(MoveCmdTimeAfkReturn, MoveCmdTime, 5000)
 	MoveSim_Check("AFK is not slowmo", res.info.detectSlow == 0, &res);
 }
 
-// signon packets after a level change carry no moves: not packet loss
+// signon packets after a level change carry no moves: not command loss
 TEST(MoveCmdTimeLevelChange, MoveCmdTime, 5000)
 {
 	movesim_params_t p;
@@ -379,7 +428,7 @@ TEST(MoveCmdTimeLevelChange, MoveCmdTime, 5000)
 	p.signonPackets = 50;
 	MoveSim_Run(&p, &res);
 
-	MoveSim_Check("signon packets are not counted as lost", res.info.lostPackets == 0 && res.info.exclLossMs == 0, &res);
+	MoveSim_Check("signon packets are not counted as lost", res.info.exclLossMs == 0, &res);
 	MoveSim_Check("level change is not slowmo", res.info.detectSlow == 0, &res);
 }
 
@@ -425,16 +474,17 @@ TEST(MoveCmdTimeSpeedhack, MoveCmdTime, 5000)
 	MoveSim_Check("speedhack x4 commands are dropped while detected", res.dropped > 0, &res);
 }
 
-// Known limitation: a client faking a lost packet before every packet keeps
-// its whole session out of the measurement. It cannot hide that: the time
-// shows up as excluded for loss (LOSS-HEAVY in the telemetry).
+// Known limitation: a client faking command loss beyond the backups before
+// every packet keeps its whole session out of the measurement. It cannot
+// hide that: the time shows up as excluded for loss (LOSS-HEAVY in the
+// telemetry).
 TEST(MoveCmdTimeFakedLoss, MoveCmdTime, 5000)
 {
 	movesim_params_t p;
 	movesim_result_t res;
 	MoveSim_Defaults(&p);
 	p.speed = 0.4;
-	p.fakeLoss = true;
+	p.fakeSkip = 3;
 	MoveSim_Run(&p, &res);
 
 	MoveSim_Check("faked loss is visible as excluded time", res.info.exclLossMs >= 50000, &res);
