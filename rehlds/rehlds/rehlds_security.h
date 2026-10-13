@@ -70,8 +70,10 @@ public:
 	void ClientConnected(unsigned int clientId);
 
 	// SV_ParseMove: netDrop/numBackup are the engine's lost-command
-	// bookkeeping for the move packet
-	void OnMoveParsed(unsigned int clientId, int netDrop, int numBackup);
+	// bookkeeping for the move packet, lastMsec the time of the lastcmd it
+	// replays lost commands with, cmdsZeroed - the engine zeroed the msec of
+	// the packet's commands (FL_FROZEN, paused)
+	void OnMoveParsed(unsigned int clientId, int netDrop, int numBackup, int lastMsec, bool cmdsZeroed);
 
 	// telemetry hooks
 	void OnClockWindowSet(unsigned int clientId, double dif);
@@ -149,12 +151,16 @@ private:
 		uint64_t exclDebtMs;       // client time still expected for an excluded silence
 		uint64_t exclDebtSinceMs;  // realtime ms the silence debt was last added
 		bool lossPending;          // a packet arrived after unrecoverable command loss, its commands are not judged
+		bool cmdsZeroed;           // the engine zeroed the msec of the current packet's commands (FL_FROZEN, paused)
 
 		// air-stuck: a span of commands that keep coming with (almost) no
 		// client time in them, judged in AIRSTUCK_CHUNK_MS chunks
 		uint64_t stuckSpanStartMs; // realtime ms the span opened, 0 - no span
 		uint64_t stuckChunkStartMs;
 		uint64_t stuckChunkMsec;   // client time reported in the current chunk
+		uint64_t stuckMs;          // real time of the span's chunks that had no client time
+		uint64_t stuckReplayMsec;  // time of the lost commands the engine replayed before the current packet
+		bool stuckLossGap;         // commands were lost before the current packet and none were replayed
 		uint64_t stuckLastCmdMs;   // realtime ms of the last command seen by the span tracker
 		bool stuckFlagged;         // the span has been reported
 
@@ -194,7 +200,7 @@ private:
 private:
 	void PushRatePoint(usercmd_state_t *ust);
 	void TrackNullSpan(unsigned int clientId, usercmd_state_t *ust, unsigned int msec, uint64_t now);
-	void EndNullSpan(unsigned int clientId, usercmd_state_t *ust, uint64_t endMs);
+	void EndNullSpan(unsigned int clientId, usercmd_state_t *ust);
 	static bool WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec);
 };
 

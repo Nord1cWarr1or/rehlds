@@ -76,6 +76,7 @@ struct movesim_params_t
 	double seconds;
 	int fps;
 	int cmdsPerPacket;
+	int numBackup;             // cl_cmdbackup
 	double speed;              // game-time scale the client reports
 	unsigned int lossPermille; // random packet loss
 	int fakeSkip;              // extra sequence numbers the client skips before every packet
@@ -94,6 +95,11 @@ struct movesim_params_t
 	double silenceAt;
 	double silenceLen;
 
+	// client hitch: no frames for hitchLen, the next frame carries the time
+	// capped at 250ms like Host_FilterTime does
+	double hitchAt;
+	double hitchLen;
+
 	// level change: the client is inactive, its signon packets carry no
 	// moves but take sequence numbers the server's netchan does see
 	double levelChangeAt;
@@ -101,9 +107,11 @@ struct movesim_params_t
 	int signonPackets;
 
 	// server freeze (a freeze plugin sets FL_FROZEN): the engine zeroes the
-	// msec of the new commands, the client keeps sending them
+	// msec of the new commands, the client keeps sending them. With
+	// frozenEvery > 0 the freeze repeats every that many seconds.
 	double frozenAt;
 	double frozenLen;
+	double frozenEvery;
 
 	// sv_rehlds_movecmd_max_null_streak for the run
 	int nullStreak;
@@ -114,6 +122,7 @@ struct movesim_params_t
 	double stuckAt;
 	double stuckLen;
 	int stuckTickEvery;
+	int stuckSkipEvery;        // while stuck, every that many-th packet skips a sequence number (faked loss)
 };
 
 struct movesim_result_t
@@ -135,6 +144,7 @@ extern cvar_t sv_rehlds_movecmd_max_null_streak;
 
 static client_t s_simClients[MAX_CLIENTS];
 static edict_t s_simPlayer;
+static byte s_simLastCmdMsec; // host_client->lastcmd.msec
 
 static void MoveSim_Defaults(movesim_params_t *p)
 {
@@ -142,9 +152,11 @@ static void MoveSim_Defaults(movesim_params_t *p)
 	p->seconds = 60.0;
 	p->fps = 100;
 	p->cmdsPerPacket = 3;
+	p->numBackup = 2;
 	p->speed = 1.0;
 	p->releasePerMs = 10;
 	p->silenceAt = -1.0;
+	p->hitchAt = -1.0;
 	p->levelChangeAt = -1.0;
 	p->frozenAt = -1.0;
 	p->stuckAt = -1.0;
@@ -163,7 +175,7 @@ static void MoveSim_RunCmd(byte msec, movesim_result_t *res)
 	}
 }
 
-static void MoveSim_Deliver(const movesim_packet_t *pkt, double atSec, int *lastSeq, movesim_result_t *res, bool frozen)
+static void MoveSim_Deliver(const movesim_params_t *p, const movesim_packet_t *pkt, double atSec, int *lastSeq, movesim_result_t *res, bool frozen)
 {
 	// server frames are 1ms long, a packet is processed in the frame it arrives
 	double serverTime = 1000.0 + ceil(atSec * 1000.0 - 1e-6) / 1000.0;
@@ -181,16 +193,13 @@ static void MoveSim_Deliver(const movesim_packet_t *pkt, double atSec, int *last
 
 	// a frozen player's moves are zeroed and nothing lost is rerun
 	if (frozen) {
-		s_simPlayer.v.flags |= FL_FROZEN;
 		netDrop = 0;
-	} else {
-		s_simPlayer.v.flags &= ~FL_FROZEN;
 	}
 
-	g_UserCmdTimeLimiter.OnMoveParsed(0, netDrop, 2);
+	g_UserCmdTimeLimiter.OnMoveParsed(0, netDrop, p->numBackup, s_simLastCmdMsec, frozen);
 
 	if (netDrop > 0 && netDrop < 24) {
-		int backups = (netDrop < 2) ? netDrop : 2;
+		int backups = (netDrop < p->numBackup) ? netDrop : p->numBackup;
 		for (int i = 2 - backups; i < 2; i++) {
 			MoveSim_RunCmd(pkt->backup[i], res);
 		}
@@ -199,6 +208,9 @@ static void MoveSim_Deliver(const movesim_packet_t *pkt, double atSec, int *last
 	for (int i = 0; i < pkt->numCmds; i++) {
 		MoveSim_RunCmd(frozen ? 0 : pkt->msec[i], res);
 	}
+
+	// REHLDS_FIXES keeps the oldest new command as lastcmd
+	s_simLastCmdMsec = frozen ? 0 : pkt->msec[0];
 }
 
 static bool MoveSim_InWindow(double t, double every, double len)
@@ -218,6 +230,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	Q_memset(res, 0, sizeof(*res));
 	Q_memset(s_simClients, 0, sizeof(s_simClients));
 	Q_memset(&s_simPlayer, 0, sizeof(s_simPlayer));
+	s_simLastCmdMsec = 0;
 	s_simClients[0].active = TRUE;
 	s_simClients[0].connected = TRUE;
 	g_psvs.clients = s_simClients;
@@ -238,7 +251,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	int seq = 0;
 	int lastSeq = 0;
 	int stuckCmds = 0;
+	int stuckPackets = 0;
 	bool inLevelChange = false;
+	bool inHitch = false;
 
 	Q_memset(&pkt, 0, sizeof(pkt));
 
@@ -267,8 +282,19 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 			continue;
 		}
 
+		if (p->hitchAt >= 0.0 && t >= p->hitchAt && t < p->hitchAt + p->hitchLen) {
+			inHitch = true;
+			continue;
+		}
+
+		if (inHitch) {
+			inHitch = false;
+			msecCarry += ((p->hitchLen < 0.25) ? p->hitchLen : 0.25) * 1000.0 * p->speed;
+		}
+
+		bool stuck = p->stuckAt >= 0.0 && t >= p->stuckAt && t < p->stuckAt + p->stuckLen;
 		int msec;
-		if (p->stuckAt >= 0.0 && t >= p->stuckAt && t < p->stuckAt + p->stuckLen) {
+		if (stuck) {
 			stuckCmds++;
 			msec = (p->stuckTickEvery > 0 && stuckCmds % p->stuckTickEvery == 0) ? 1 : 0;
 		} else {
@@ -284,6 +310,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 		}
 
 		seq += pkt.numCmds + p->fakeSkip;
+		if (stuck && p->stuckSkipEvery > 0 && ++stuckPackets % p->stuckSkipEvery == 0) {
+			seq++;
+		}
 		pkt.seq = seq;
 		pkt.backup[0] = prev[0];
 		pkt.backup[1] = prev[1];
@@ -293,7 +322,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 		lcg = lcg * 1103515245 + 12345;
 		bool lost = ((lcg >> 16) % 1000) < p->lossPermille
 			|| MoveSim_InWindow(t, p->outageEvery, p->outageLen);
-		bool frozen = p->frozenAt >= 0.0 && t >= p->frozenAt && t < p->frozenAt + p->frozenLen;
+		bool frozen = (p->frozenEvery > 0.0)
+			? MoveSim_InWindow(t, p->frozenEvery, p->frozenLen)
+			: (p->frozenAt >= 0.0 && t >= p->frozenAt && t < p->frozenAt + p->frozenLen);
 
 		if (!lost)
 		{
@@ -306,9 +337,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 				// a released hold arrives in a burst: releasePerMs packets
 				// per server frame, then the current packet
 				for (int i = 0; i < numHeld; i++) {
-					MoveSim_Deliver(&held[i], t + (i / p->releasePerMs) * 0.001, &lastSeq, res, frozen);
+					MoveSim_Deliver(p, &held[i], t + (i / p->releasePerMs) * 0.001, &lastSeq, res, frozen);
 				}
-				MoveSim_Deliver(&pkt, t + (numHeld / p->releasePerMs) * 0.001, &lastSeq, res, frozen);
+				MoveSim_Deliver(p, &pkt, t + (numHeld / p->releasePerMs) * 0.001, &lastSeq, res, frozen);
 				numHeld = 0;
 			}
 		}
@@ -530,6 +561,39 @@ TEST(MoveCmdTimeAirstuckTicks, MoveCmdTime, 5000)
 	MoveSim_Check("air-stuck with a 1ms tick every 20 commands is detected", res.info.airstuckCount == 1, &res);
 }
 
+// faked loss (cl_cmdbackup 0, a sequence number skipped every few packets)
+// makes the engine replay lastcmd - with no time in it, the hang goes on
+TEST(MoveCmdTimeAirstuckFakeLoss, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.stuckAt = 40.0;
+	p.stuckLen = 6.0;
+	p.numBackup = 0;
+	p.stuckSkipEvery = 5;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("air-stuck under faked loss is detected", res.info.airstuckCount == 1, &res);
+}
+
+// lag-switch style: the stuck commands are held back and released in bursts
+TEST(MoveCmdTimeAirstuckHeld, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.stuckAt = 40.0;
+	p.stuckLen = 8.0;
+	p.holdEvery = 0.8;
+	p.holdLen = 0.6;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("air-stuck released in held bursts is detected", res.info.airstuckCount == 1, &res);
+}
+
 // over 1000 fps the client carries the fraction of a millisecond over:
 // zeros alternate with ones, never a long zero run
 TEST(MoveCmdTimeHighFps2000, MoveCmdTime, 5000)
@@ -557,9 +621,45 @@ TEST(MoveCmdTimeHighFps2000Afk, MoveCmdTime, 5000)
 	p.cmdsPerPacket = 20;
 	p.silenceAt = 20.0;
 	p.silenceLen = 5.0;
+	p.nullStreak = 20;
 	MoveSim_Run(&p, &res);
 
 	MoveSim_Check("a dead connection at 2000 fps is not air-stuck", res.info.airstuckCount == 0, &res);
+}
+
+// held bursts at 2000 fps: the burst after the hold carries its time
+TEST(MoveCmdTimeHighFps2000Held, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.seconds = 90.0;
+	p.fps = 2000;
+	p.cmdsPerPacket = 20;
+	p.holdEvery = 3.0;
+	p.holdLen = 0.7;
+	p.releasePerMs = 1;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("held bursts at 2000 fps are not air-stuck", res.info.airstuckCount == 0, &res);
+	MoveSim_Check("held bursts at 2000 fps are not slowmo", res.info.detectSlow == 0, &res);
+}
+
+// a 1.5s client hitch at 2000 fps: the next frame carries 250ms
+TEST(MoveCmdTimeHighFps2000Hitch, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.fps = 2000;
+	p.cmdsPerPacket = 20;
+	p.hitchAt = 20.0;
+	p.hitchLen = 1.5;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("a client hitch at 2000 fps is not air-stuck", res.info.airstuckCount == 0, &res);
 }
 
 // DDoS: nearly every packet lost, the few that arrive carry little time
@@ -572,10 +672,29 @@ TEST(MoveCmdTimeHighFpsHeavyLoss, MoveCmdTime, 5000)
 	p.fps = 2000;
 	p.cmdsPerPacket = 20;
 	p.lossPermille = 900;
+	p.nullStreak = 20;
 	MoveSim_Run(&p, &res);
 
 	MoveSim_Check("90% loss at 2000 fps is not air-stuck", res.info.airstuckCount == 0, &res);
 	MoveSim_Check("90% loss at 2000 fps is not slowmo", res.info.detectSlow == 0, &res);
+}
+
+// a plugin freezing for 0.3s every second: the frozen time is the
+// server's, not a slowdown
+TEST(MoveCmdTimeFrozenPulses, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.seconds = 90.0;
+	p.frozenEvery = 1.0;
+	p.frozenLen = 0.3;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("frequent short freezes are counted as frozen", res.info.frozenCmds > 0, &res);
+	MoveSim_Check("frequent short freezes are not slowmo", res.info.detectSlow == 0 && res.info.rate > 0.95 && res.info.rate < 1.05, &res);
+	MoveSim_Check("frequent short freezes are not air-stuck", res.info.airstuckCount == 0, &res);
 }
 
 TEST(MoveCmdTimeSlowmoCheat, MoveCmdTime, 5000)

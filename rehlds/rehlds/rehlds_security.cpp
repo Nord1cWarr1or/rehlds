@@ -335,7 +335,7 @@ void CUserCmdTimeLimiter::ClientConnected(unsigned int clientId)
 #define LOSS_HEAVY_SHARE      0.8    // telemetry: share of a dump period excluded for packet loss that is logged
 #define AIRSTUCK_MIN_MS       1000   // commands with no client time in them for this long are an air-stuck
 #define AIRSTUCK_CHUNK_MS     250    // the air-stuck span is judged in chunks of this much real time
-#define AIRSTUCK_SILENCE_MS   500    // a command silence this long breaks the span: no commands, no evidence
+#define AIRSTUCK_BREAK_MS     2000   // a command silence this long ends the span: no commands, no evidence
 
 // server stall state: a host frame longer than sv_rehlds_movecmdtime_stall_threshold
 // means the server could not process client commands (freeze, map load, background
@@ -392,11 +392,11 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	uint64_t now = (uint64_t)(realtime * 1000.0);
 
-	// A paused server or an FL_FROZEN client (a freeze plugin): the engine
-	// zeroes the msec of such a client's commands in SV_ParseMove, and the
-	// client keeps sending them (seen live). These zeros are the server's -
-	// no null streak, no speed judgment.
-	bool serverFrozen = g_psv.paused || (sv_player->v.flags & FL_FROZEN);
+	// A paused server or an FL_FROZEN client (a freeze plugin): SV_ParseMove
+	// zeroed the msec of the packet's commands, and the client keeps sending
+	// them (seen live). These zeros are the server's - no null streak, no
+	// speed judgment.
+	bool serverFrozen = ust->cmdsZeroed;
 	if (serverFrozen) {
 		ust->frozenCmds++;
 		ust->consecutiveNullCmds = 0;
@@ -405,7 +405,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// air-stuck sees every command the client sent, before any drop gate
 	if (sv_rehlds_movecmdtime_enabled.value > 0.0f) {
 		if (serverFrozen) {
-			EndNullSpan(clientId, ust, ust->stuckLastCmdMs);
+			EndNullSpan(clientId, ust);
 		} else {
 			TrackNullSpan(clientId, ust, ucmd->msec, now);
 		}
@@ -448,7 +448,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 				nullDrop = true;
 				if (sv_rehlds_movecmdtime_debug.value >= 2.0f && realtime - ust->lastDropLogTime >= 5.0) {
 					ust->lastDropLogTime = realtime;
-					MCmd_Log("DROP-NULL name=%s total=%u streak=%u (cmd dropped, its real time still counted)",
+					MCmd_Log("DROP-NULL name=%s total=%u streak=%u (cmd dropped)",
 						cl->name, ust->nullDrops, ust->consecutiveNullCmds);
 				}
 			}
@@ -485,8 +485,11 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	}
 
 	// any slowdown measured on server-zeroed commands would be the engine's
-	// doing, not the client's
+	// doing, not the client's: the frozen time stays out of the window
 	if (serverFrozen) {
+		if (ust->lastUpdateTime != 0) {
+			ust->lastUpdateTime = now;
+		}
 		return false;
 	}
 
@@ -781,13 +784,52 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *ust, unsigned int msec, uint64_t now)
 {
-	// commands stopped coming (dead connection, minimized game, loading) or
-	// were lost: there is no evidence across the break
-	if (ust->stuckSpanStartMs != 0
-		&& (now - ust->stuckLastCmdMs > AIRSTUCK_SILENCE_MS || ust->lossPending)) {
-		EndNullSpan(clientId, ust, ust->stuckLastCmdMs);
+	if (ust->stuckSpanStartMs != 0 && now != ust->stuckLastCmdMs)
+	{
+		if (now - ust->stuckLastCmdMs > AIRSTUCK_BREAK_MS)
+		{
+			// A long break (level change, dead connection) leaves no
+			// evidence. A shorter one stays in the chunk: the client caps
+			// its frame time at 250ms, so after a hitch its next command
+			// still carries more than a tenth of a break this short, and
+			// held-back commands carry their time.
+			EndNullSpan(clientId, ust);
+		}
+		else
+		{
+			// a chunk is judged once every command that arrived with its
+			// last one is in: commands made before a client hitch come in
+			// the same packet as the frame that carries the hitch time
+			uint64_t chunkLen = ust->stuckLastCmdMs - ust->stuckChunkStartMs;
+			if (chunkLen >= AIRSTUCK_CHUNK_MS) {
+				ust->stuckMs += chunkLen;
+				ust->stuckChunkStartMs = ust->stuckLastCmdMs;
+				ust->stuckChunkMsec = 0;
+
+				if (!ust->stuckFlagged && ust->stuckMs >= AIRSTUCK_MIN_MS)
+				{
+					ust->stuckFlagged = true;
+					ust->airstuckCount++;
+					if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+						MCmd_Log("WARN name=%s type=airstuck total=%u stuck=%.1fs nullDrops=%u (commands keep coming with no game time)",
+							g_psvs.clients[clientId].name, ust->airstuckCount, ust->stuckMs / 1000.0, ust->nullDrops);
+					}
+				}
+			}
+
+			// commands lost on the way (OnMoveParsed): replayed ones carry
+			// the time of lastcmd, with nothing run the time of the gap is
+			// unknown and the chunk starts after it
+			if (ust->stuckLossGap) {
+				ust->stuckChunkStartMs = now;
+				ust->stuckChunkMsec = 0;
+			}
+			ust->stuckChunkMsec += ust->stuckReplayMsec;
+		}
 	}
 	ust->stuckLastCmdMs = now;
+	ust->stuckLossGap = false;
+	ust->stuckReplayMsec = 0;
 
 	if (ust->stuckSpanStartMs == 0)
 	{
@@ -801,36 +843,20 @@ void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *
 		ust->stuckSpanStartMs = now;
 		ust->stuckChunkStartMs = now;
 		ust->stuckChunkMsec = 0;
+		ust->stuckMs = 0;
 		ust->stuckFlagged = false;
 	}
 
 	ust->stuckChunkMsec += msec;
-	uint64_t chunkLen = now - ust->stuckChunkStartMs;
 
 	// client time flows again: more than a tenth of the real time of the chunk
+	uint64_t chunkLen = now - ust->stuckChunkStartMs;
 	if (ust->stuckChunkMsec * 10 > ((chunkLen > AIRSTUCK_CHUNK_MS) ? chunkLen : AIRSTUCK_CHUNK_MS)) {
-		EndNullSpan(clientId, ust, ust->stuckChunkStartMs);
-		return;
-	}
-
-	if (chunkLen >= AIRSTUCK_CHUNK_MS) {
-		ust->stuckChunkStartMs = now;
-		ust->stuckChunkMsec = 0;
-	}
-
-	if (!ust->stuckFlagged && ust->stuckChunkStartMs - ust->stuckSpanStartMs >= AIRSTUCK_MIN_MS)
-	{
-		ust->stuckFlagged = true;
-		ust->airstuckCount++;
-		if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
-			MCmd_Log("WARN name=%s type=airstuck total=%u stuck=%.1fs nullDrops=%u (commands keep coming with no game time)",
-				g_psvs.clients[clientId].name, ust->airstuckCount,
-				(ust->stuckChunkStartMs - ust->stuckSpanStartMs) / 1000.0, ust->nullDrops);
-		}
+		EndNullSpan(clientId, ust);
 	}
 }
 
-void CUserCmdTimeLimiter::EndNullSpan(unsigned int clientId, usercmd_state_t *ust, uint64_t endMs)
+void CUserCmdTimeLimiter::EndNullSpan(unsigned int clientId, usercmd_state_t *ust)
 {
 	if (ust->stuckSpanStartMs == 0) {
 		return;
@@ -838,10 +864,9 @@ void CUserCmdTimeLimiter::EndNullSpan(unsigned int clientId, usercmd_state_t *us
 
 	if (ust->stuckFlagged)
 	{
-		uint64_t spanMs = (endMs > ust->stuckSpanStartMs) ? (endMs - ust->stuckSpanStartMs) : 0;
-		ust->airstuckMs += spanMs;
+		ust->airstuckMs += ust->stuckMs;
 		if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
-			MCmd_Log("AIRSTUCK-END name=%s duration=%.1fs", g_psvs.clients[clientId].name, spanMs / 1000.0);
+			MCmd_Log("AIRSTUCK-END name=%s duration=%.1fs", g_psvs.clients[clientId].name, ust->stuckMs / 1000.0);
 		}
 	}
 
@@ -860,6 +885,14 @@ void CUserCmdTimeLimiter::Frame()
 	}
 
 	unsigned int numClients = (g_psvs.maxclientslimit < MAX_CLIENTS) ? (unsigned int)g_psvs.maxclientslimit : MAX_CLIENTS;
+
+	// an inactive client (level change, signon) sends no moves: an air-stuck
+	// span does not carry over
+	for (unsigned int i = 0; i < numClients; i++) {
+		if (!g_psvs.clients[i].active) {
+			EndNullSpan(i, &m_States[i]);
+		}
+	}
 
 	if (sv_rehlds_movecmdtime_debug.value < 1.0f) {
 		return;
@@ -901,7 +934,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 	double periodSec = (ust->lastDumpTime > 0.0) ? (realtime - ust->lastDumpTime) : 0.0;
 	uint64_t periodLossMs = ust->exclLossMs - ust->dumpExclLossMs;
 	if (periodSec >= 5.0 && periodLossMs >= periodSec * 1000.0 * LOSS_HEAVY_SHARE) {
-		MCmd_Log("LOSS-HEAVY name=%s excluded=%.1fs/%.1fs replayed=%u lost=%u (speed not measurable while commands are lost)",
+		MCmd_Log("LOSS-HEAVY name=%s excluded=%.1fs/%.1fs lost=(r:%u l:%u) (speed not measurable while commands are lost)",
 			cl->name, periodLossMs / 1000.0, periodSec, ust->replayedCmds, ust->lostCmds);
 	}
 	ust->lastDumpTime = realtime;
@@ -986,11 +1019,16 @@ void CUserCmdTimeLimiter::OnCmdSkippedByClockWindow(unsigned int clientId)
 	ust->cwActive = true;
 	ust->cwSkippedCmds++;
 	ust->cwSkippedTotal++;
+
+	// the skipped commands carry client time the air-stuck span never sees
+	EndNullSpan(clientId, ust);
 }
 
-void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int numBackup)
+void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int numBackup, int lastMsec, bool cmdsZeroed)
 {
 	usercmd_state_t *ust = &m_States[clientId];
+
+	ust->cmdsZeroed = cmdsZeroed;
 
 	// net_drop counts lost commands, not packets: the client gives every
 	// command a sequence number, held-back ones too (fps above cl_cmdrate),
@@ -1006,6 +1044,17 @@ void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int n
 	ust->lossPending = true;
 
 	unsigned int missing = (unsigned int)(netDrop - numBackup);
+
+	// air-stuck span: the replayed commands carry the time of lastcmd (none
+	// for a stuck client, faked loss included); with nothing run the time of
+	// the gap is unknown
+	if (ust->stuckSpanStartMs != 0) {
+		if (netDrop < 24) {
+			ust->stuckReplayMsec += (uint64_t)missing * (unsigned int)lastMsec;
+		} else {
+			ust->stuckLossGap = true;
+		}
+	}
 
 	if (netDrop < 24) {
 		ust->replayedCmds += missing;
