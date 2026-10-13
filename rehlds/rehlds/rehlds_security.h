@@ -86,6 +86,8 @@ public:
 		unsigned int budgetClamps;
 		unsigned int nullDrops;    // commands dropped by the null-command streak limit
 		unsigned int frozenCmds;   // commands the engine zeroed itself (FL_FROZEN, paused)
+		unsigned int airstuckCount; // spans of commands that kept coming with no game time
+		uint64_t airstuckMs;       // real time of those spans
 		uint64_t exclGapMs;        // real time kept out of the window: client silence
 		uint64_t exclLossMs;       // real time kept out of the window: lost client commands
 	};
@@ -148,6 +150,14 @@ private:
 		uint64_t exclDebtSinceMs;  // realtime ms the silence debt was last added
 		bool lossPending;          // a packet arrived after unrecoverable command loss, its commands are not judged
 
+		// air-stuck: a span of commands that keep coming with (almost) no
+		// client time in them, judged in AIRSTUCK_CHUNK_MS chunks
+		uint64_t stuckSpanStartMs; // realtime ms the span opened, 0 - no span
+		uint64_t stuckChunkStartMs;
+		uint64_t stuckChunkMsec;   // client time reported in the current chunk
+		uint64_t stuckLastCmdMs;   // realtime ms of the last command seen by the span tracker
+		bool stuckFlagged;         // the span has been reported
+
 		// punishment state
 		unsigned int warnings[ABUSE_MAX];
 		uint64_t lastDetectMs;     // throttle of warning accrual inside one episode
@@ -158,6 +168,8 @@ private:
 		unsigned int ticksDrops;        // cmds dropped by sv_rehlds_movecmd_max_ticks
 		unsigned int nullDrops;         // cmds dropped by sv_rehlds_movecmd_max_null_streak
 		unsigned int frozenCmds;        // cmds whose msec the engine zeroed itself (FL_FROZEN, paused)
+		unsigned int airstuckCount;     // air-stuck spans
+		uint64_t airstuckMs;            // real time of the air-stuck spans
 		unsigned int interpDrops;       // cmds dropped by sv_rehlds_movecmd_clamp_interp
 		unsigned int budgetClamps;      // commands clipped by the movement-time budget
 		unsigned int stallImmuneSkipped; // slowmo warnings not accrued because a server stall was detected
@@ -181,6 +193,8 @@ private:
 
 private:
 	void PushRatePoint(usercmd_state_t *ust);
+	void TrackNullSpan(unsigned int clientId, usercmd_state_t *ust, unsigned int msec, uint64_t now);
+	void EndNullSpan(unsigned int clientId, usercmd_state_t *ust, uint64_t endMs);
 	static bool WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec);
 };
 

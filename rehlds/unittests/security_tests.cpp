@@ -107,6 +107,13 @@ struct movesim_params_t
 
 	// sv_rehlds_movecmd_max_null_streak for the run
 	int nullStreak;
+
+	// air-stuck cheat: the client keeps sending commands with no time in
+	// them; with stuckTickEvery > 0 every that many-th command carries 1ms
+	// (dodges a plain zero-streak limit)
+	double stuckAt;
+	double stuckLen;
+	int stuckTickEvery;
 };
 
 struct movesim_result_t
@@ -140,6 +147,7 @@ static void MoveSim_Defaults(movesim_params_t *p)
 	p->silenceAt = -1.0;
 	p->levelChangeAt = -1.0;
 	p->frozenAt = -1.0;
+	p->stuckAt = -1.0;
 }
 
 static void MoveSim_RunCmd(byte msec, movesim_result_t *res)
@@ -229,6 +237,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	double msecCarry = 0.0;
 	int seq = 0;
 	int lastSeq = 0;
+	int stuckCmds = 0;
 	bool inLevelChange = false;
 
 	Q_memset(&pkt, 0, sizeof(pkt));
@@ -258,10 +267,16 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 			continue;
 		}
 
-		msecCarry += frameSec * 1000.0 * p->speed;
-		int msec = (int)msecCarry;
-		if (msec > 255) msec = 255;
-		msecCarry -= msec;
+		int msec;
+		if (p->stuckAt >= 0.0 && t >= p->stuckAt && t < p->stuckAt + p->stuckLen) {
+			stuckCmds++;
+			msec = (p->stuckTickEvery > 0 && stuckCmds % p->stuckTickEvery == 0) ? 1 : 0;
+		} else {
+			msecCarry += frameSec * 1000.0 * p->speed;
+			msec = (int)msecCarry;
+			if (msec > 255) msec = 255;
+			msecCarry -= msec;
+		}
 		pkt.msec[pkt.numCmds++] = (byte)msec;
 
 		if (pkt.numCmds < p->cmdsPerPacket) {
@@ -314,11 +329,12 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 static void MoveSim_Check(const char *what, bool cond, const movesim_result_t *res)
 {
 	char msg[512];
-	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u exclGap=%llums exclLoss=%llums null=%u frz=%u)",
+	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u exclGap=%llums exclLoss=%llums null=%u frz=%u air=%u/%llums)",
 		what, res->info.rate, res->info.winSec, res->info.detectSlow, res->info.detectSpeed,
 		res->info.budgetClamps, res->dropped, res->judged,
 		(unsigned long long)res->info.exclGapMs, (unsigned long long)res->info.exclLossMs,
-		res->info.nullDrops, res->info.frozenCmds);
+		res->info.nullDrops, res->info.frozenCmds,
+		res->info.airstuckCount, (unsigned long long)res->info.airstuckMs);
 	CHECK(msg, cond);
 }
 
@@ -391,6 +407,7 @@ TEST(MoveCmdTimeShortOutages, MoveCmdTime, 5000)
 
 	MoveSim_Check("outages are seen as lost commands", res.info.exclLossMs > 0, &res);
 	MoveSim_Check("outages are not slowmo", res.info.detectSlow == 0, &res);
+	MoveSim_Check("outages are not air-stuck", res.info.airstuckCount == 0, &res);
 	MoveSim_Check("speed between outages is measured and real", res.info.winSec >= 15.0 && res.info.rate > 0.95 && res.info.rate < 1.05, &res);
 }
 
@@ -405,6 +422,7 @@ TEST(MoveCmdTimeHeavyRandomLoss, MoveCmdTime, 5000)
 	MoveSim_Run(&p, &res);
 
 	MoveSim_Check("heavy loss is not slowmo", res.info.detectSlow == 0, &res);
+	MoveSim_Check("heavy loss is not air-stuck", res.info.airstuckCount == 0, &res);
 	MoveSim_Check("speed under heavy loss is measured and real", res.info.winSec >= 15.0 && res.info.rate > 0.9 && res.info.rate < 1.1, &res);
 	MoveSim_Check("no command of a lossy client is dropped", res.dropped == 0, &res);
 }
@@ -439,6 +457,7 @@ TEST(MoveCmdTimeAfkReturn, MoveCmdTime, 5000)
 	MoveSim_Check("AFK silence is excluded", res.info.exclGapMs >= 29000, &res);
 	MoveSim_Check("AFK return is measured at real speed", res.info.rate > 0.98 && res.info.rate < 1.02, &res);
 	MoveSim_Check("AFK is not slowmo", res.info.detectSlow == 0, &res);
+	MoveSim_Check("AFK is not air-stuck", res.info.airstuckCount == 0, &res);
 }
 
 // signon packets after a level change carry no moves: not command loss
@@ -475,7 +494,88 @@ TEST(MoveCmdTimeFrozenByServer, MoveCmdTime, 5000)
 	MoveSim_Check("server-zeroed commands are counted as frozen", res.info.frozenCmds > 0, &res);
 	MoveSim_Check("server-zeroed commands are no null streak", res.info.nullDrops == 0 && res.dropped == 0, &res);
 	MoveSim_Check("a server freeze is not slowmo", res.info.detectSlow == 0, &res);
+	MoveSim_Check("a server freeze is not air-stuck", res.info.airstuckCount == 0, &res);
 	MoveSim_Check("speed after the freeze is real", res.info.rate > 0.98 && res.info.rate < 1.02, &res);
+}
+
+// air-stuck: commands keep coming with no game time in them. The null
+// streak limit drops them, the hang must still show in the speed window.
+TEST(MoveCmdTimeAirstuck, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.stuckAt = 40.0;
+	p.stuckLen = 6.0;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("air-stuck is detected once", res.info.airstuckCount == 1, &res);
+	MoveSim_Check("air-stuck duration is measured", res.info.airstuckMs >= 4500 && res.info.airstuckMs <= 6500, &res);
+	MoveSim_Check("the hang is visible to the speed window", res.info.winSec >= 50.0 && res.info.rate < 0.95, &res);
+	MoveSim_Check("zero-time commands past the streak limit are dropped", res.info.nullDrops > 0, &res);
+}
+
+TEST(MoveCmdTimeAirstuckTicks, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.stuckAt = 40.0;
+	p.stuckLen = 6.0;
+	p.stuckTickEvery = 20;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("air-stuck with a 1ms tick every 20 commands is detected", res.info.airstuckCount == 1, &res);
+}
+
+// over 1000 fps the client carries the fraction of a millisecond over:
+// zeros alternate with ones, never a long zero run
+TEST(MoveCmdTimeHighFps2000, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.fps = 2000;
+	p.cmdsPerPacket = 20;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("2000 fps is not air-stuck", res.info.airstuckCount == 0 && res.info.nullDrops == 0, &res);
+	MoveSim_Check("2000 fps is measured at real speed", res.info.rate > 0.98 && res.info.rate < 1.02, &res);
+}
+
+// the connection dies right after a zero-time command: no commands, no
+// evidence of a hang
+TEST(MoveCmdTimeHighFps2000Afk, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.fps = 2000;
+	p.cmdsPerPacket = 20;
+	p.silenceAt = 20.0;
+	p.silenceLen = 5.0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("a dead connection at 2000 fps is not air-stuck", res.info.airstuckCount == 0, &res);
+}
+
+// DDoS: nearly every packet lost, the few that arrive carry little time
+TEST(MoveCmdTimeHighFpsHeavyLoss, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.seconds = 90.0;
+	p.fps = 2000;
+	p.cmdsPerPacket = 20;
+	p.lossPermille = 900;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("90% loss at 2000 fps is not air-stuck", res.info.airstuckCount == 0, &res);
+	MoveSim_Check("90% loss at 2000 fps is not slowmo", res.info.detectSlow == 0, &res);
 }
 
 TEST(MoveCmdTimeSlowmoCheat, MoveCmdTime, 5000)
