@@ -389,6 +389,16 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	uint64_t now = (uint64_t)(realtime * 1000.0);
 
+	// A paused server or an FL_FROZEN client (a freeze plugin): the engine
+	// zeroes the msec of such a client's commands in SV_ParseMove, and the
+	// client keeps sending them (seen live). These zeros are the server's -
+	// no null streak, no speed judgment.
+	bool serverFrozen = g_psv.paused || (sv_player->v.flags & FL_FROZEN);
+	if (serverFrozen) {
+		ust->frozenCmds++;
+		ust->consecutiveNullCmds = 0;
+	}
+
 	// check move command flood within a single server tick
 	if (sv_rehlds_movecmd_max_ticks.value > 0)
 	{
@@ -413,7 +423,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// air-stuck (consecutive 0 msec commands)
 	// legitimate >1000 FPS clients may occasionally send msec=0 due to byte truncation,
 	// but only illegitimate clients send long unbroken streaks of zero time
-	if (sv_rehlds_movecmd_max_null_streak.value > 0)
+	if (sv_rehlds_movecmd_max_null_streak.value > 0 && !serverFrozen)
 	{
 		if (ucmd->msec == 0)
 		{
@@ -459,12 +469,9 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		return false;
 	}
 
-	// A paused server or an FL_FROZEN client does not judge speeds: the
-	// engine zeroes such clients' msec in SV_ParseMove, so any measured
-	// slowdown would be the engine's doing, not the client's. Tested live:
-	// stock clients stop sending dense movecmds here, this gate covers
-	// custom builds that keep sending.
-	if (g_psv.paused || (sv_player->v.flags & FL_FROZEN)) {
+	// any slowdown measured on server-zeroed commands would be the engine's
+	// doing, not the client's
+	if (serverFrozen) {
 		return false;
 	}
 
@@ -817,7 +824,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 
 	// clockRate drifts permanently after speedhack sessions (reported msec
 	// cannot be unreported) - rate above is the live metric
-	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u) excl=(g:%.0fs l:%.0fs) msec=%llums age=%.0fs",
+	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u) excl=(g:%.0fs l:%.0fs) frz=%u msec=%llums age=%.0fs",
 		cl->name,
 		info.rate, info.winSec, clockRate,
 		ust->avgMsec,
@@ -832,6 +839,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		ust->rateRestarts,
 		ust->replayedCmds, ust->lostCmds,
 		ust->exclGapMs / 1000.0, ust->exclLossMs / 1000.0,
+		ust->frozenCmds,
 		(unsigned long long)ust->totalMsec,
 		elapsedMs / 1000.0);
 }
@@ -863,6 +871,8 @@ void CUserCmdTimeLimiter::GetMeasureInfo(unsigned int clientId, measure_info_t *
 	info->detectSpeed = ust->telemWarn[ABUSE_SPEEDHACK];
 	info->detectSlow = ust->telemWarn[ABUSE_SLOWMO];
 	info->budgetClamps = ust->budgetClamps;
+	info->nullDrops = ust->nullDrops;
+	info->frozenCmds = ust->frozenCmds;
 	info->exclGapMs = ust->exclGapMs;
 	info->exclLossMs = ust->exclLossMs;
 }

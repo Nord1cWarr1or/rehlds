@@ -99,6 +99,14 @@ struct movesim_params_t
 	double levelChangeAt;
 	double levelChangeLen;
 	int signonPackets;
+
+	// server freeze (a freeze plugin sets FL_FROZEN): the engine zeroes the
+	// msec of the new commands, the client keeps sending them
+	double frozenAt;
+	double frozenLen;
+
+	// sv_rehlds_movecmd_max_null_streak for the run
+	int nullStreak;
 };
 
 struct movesim_result_t
@@ -116,6 +124,8 @@ struct movesim_packet_t
 	byte backup[2]; // [0] older, [1] newer
 };
 
+extern cvar_t sv_rehlds_movecmd_max_null_streak;
+
 static client_t s_simClients[MAX_CLIENTS];
 static edict_t s_simPlayer;
 
@@ -129,6 +139,7 @@ static void MoveSim_Defaults(movesim_params_t *p)
 	p->releasePerMs = 10;
 	p->silenceAt = -1.0;
 	p->levelChangeAt = -1.0;
+	p->frozenAt = -1.0;
 }
 
 static void MoveSim_RunCmd(byte msec, movesim_result_t *res)
@@ -144,7 +155,7 @@ static void MoveSim_RunCmd(byte msec, movesim_result_t *res)
 	}
 }
 
-static void MoveSim_Deliver(const movesim_packet_t *pkt, double atSec, int *lastSeq, movesim_result_t *res)
+static void MoveSim_Deliver(const movesim_packet_t *pkt, double atSec, int *lastSeq, movesim_result_t *res, bool frozen)
 {
 	// server frames are 1ms long, a packet is processed in the frame it arrives
 	double serverTime = 1000.0 + ceil(atSec * 1000.0 - 1e-6) / 1000.0;
@@ -159,6 +170,15 @@ static void MoveSim_Deliver(const movesim_packet_t *pkt, double atSec, int *last
 	// SV_ParseMove bookkeeping: the held-back commands of this packet are
 	// not lost, only what is left of the gap is
 	int netDrop = seqGap + 1 - pkt->numCmds;
+
+	// a frozen player's moves are zeroed and nothing lost is rerun
+	if (frozen) {
+		s_simPlayer.v.flags |= FL_FROZEN;
+		netDrop = 0;
+	} else {
+		s_simPlayer.v.flags &= ~FL_FROZEN;
+	}
+
 	g_UserCmdTimeLimiter.OnMoveParsed(0, netDrop, 2);
 
 	if (netDrop > 0 && netDrop < 24) {
@@ -169,7 +189,7 @@ static void MoveSim_Deliver(const movesim_packet_t *pkt, double atSec, int *last
 	}
 
 	for (int i = 0; i < pkt->numCmds; i++) {
-		MoveSim_RunCmd(pkt->msec[i], res);
+		MoveSim_RunCmd(frozen ? 0 : pkt->msec[i], res);
 	}
 }
 
@@ -185,6 +205,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	edict_t *savedPlayer = sv_player;
 	double savedRealtime = realtime;
 	qboolean savedPaused = g_psv.paused;
+	float savedNullStreak = sv_rehlds_movecmd_max_null_streak.value;
 
 	Q_memset(res, 0, sizeof(*res));
 	Q_memset(s_simClients, 0, sizeof(s_simClients));
@@ -195,6 +216,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	g_psvs.maxclientslimit = MAX_CLIENTS;
 	sv_player = &s_simPlayer;
 	g_psv.paused = FALSE;
+	sv_rehlds_movecmd_max_null_streak.value = (float)p->nullStreak;
 	realtime = 1000.0;
 	g_UserCmdTimeLimiter.ClientConnected(0);
 
@@ -256,6 +278,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 		lcg = lcg * 1103515245 + 12345;
 		bool lost = ((lcg >> 16) % 1000) < p->lossPermille
 			|| MoveSim_InWindow(t, p->outageEvery, p->outageLen);
+		bool frozen = p->frozenAt >= 0.0 && t >= p->frozenAt && t < p->frozenAt + p->frozenLen;
 
 		if (!lost)
 		{
@@ -268,9 +291,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 				// a released hold arrives in a burst: releasePerMs packets
 				// per server frame, then the current packet
 				for (int i = 0; i < numHeld; i++) {
-					MoveSim_Deliver(&held[i], t + (i / p->releasePerMs) * 0.001, &lastSeq, res);
+					MoveSim_Deliver(&held[i], t + (i / p->releasePerMs) * 0.001, &lastSeq, res, frozen);
 				}
-				MoveSim_Deliver(&pkt, t + (numHeld / p->releasePerMs) * 0.001, &lastSeq, res);
+				MoveSim_Deliver(&pkt, t + (numHeld / p->releasePerMs) * 0.001, &lastSeq, res, frozen);
 				numHeld = 0;
 			}
 		}
@@ -285,15 +308,17 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	sv_player = savedPlayer;
 	realtime = savedRealtime;
 	g_psv.paused = savedPaused;
+	sv_rehlds_movecmd_max_null_streak.value = savedNullStreak;
 }
 
 static void MoveSim_Check(const char *what, bool cond, const movesim_result_t *res)
 {
 	char msg[512];
-	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u exclGap=%llums exclLoss=%llums)",
+	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u exclGap=%llums exclLoss=%llums null=%u frz=%u)",
 		what, res->info.rate, res->info.winSec, res->info.detectSlow, res->info.detectSpeed,
 		res->info.budgetClamps, res->dropped, res->judged,
-		(unsigned long long)res->info.exclGapMs, (unsigned long long)res->info.exclLossMs);
+		(unsigned long long)res->info.exclGapMs, (unsigned long long)res->info.exclLossMs,
+		res->info.nullDrops, res->info.frozenCmds);
 	CHECK(msg, cond);
 }
 
@@ -430,6 +455,27 @@ TEST(MoveCmdTimeLevelChange, MoveCmdTime, 5000)
 
 	MoveSim_Check("signon packets are not counted as lost", res.info.exclLossMs == 0, &res);
 	MoveSim_Check("level change is not slowmo", res.info.detectSlow == 0, &res);
+}
+
+// A freeze plugin sets FL_FROZEN, the engine zeroes the msec of the
+// player's commands while the client keeps sending them. Those zeros are
+// the server's, not an air-stuck client's: they are no null streak (the
+// commands run, as in the stock engine) and no slowdown.
+TEST(MoveCmdTimeFrozenByServer, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.seconds = 90.0;
+	p.frozenAt = 20.0;
+	p.frozenLen = 30.0;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("server-zeroed commands are counted as frozen", res.info.frozenCmds > 0, &res);
+	MoveSim_Check("server-zeroed commands are no null streak", res.info.nullDrops == 0 && res.dropped == 0, &res);
+	MoveSim_Check("a server freeze is not slowmo", res.info.detectSlow == 0, &res);
+	MoveSim_Check("speed after the freeze is real", res.info.rate > 0.98 && res.info.rate < 1.02, &res);
 }
 
 TEST(MoveCmdTimeSlowmoCheat, MoveCmdTime, 5000)

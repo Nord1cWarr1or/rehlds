@@ -84,6 +84,8 @@ public:
 		unsigned int detectSpeed;  // commands judged as speedhack
 		unsigned int detectSlow;   // commands judged as slowmo
 		unsigned int budgetClamps;
+		unsigned int nullDrops;    // commands dropped by the null-command streak limit
+		unsigned int frozenCmds;   // commands the engine zeroed itself (FL_FROZEN, paused)
 		uint64_t exclGapMs;        // real time kept out of the window: client silence
 		uint64_t exclLossMs;       // real time kept out of the window: lost client commands
 	};
@@ -155,6 +157,7 @@ private:
 		unsigned int telemWarn[ABUSE_MAX];
 		unsigned int ticksDrops;        // cmds dropped by sv_rehlds_movecmd_max_ticks
 		unsigned int nullDrops;         // cmds dropped by sv_rehlds_movecmd_max_null_streak
+		unsigned int frozenCmds;        // cmds whose msec the engine zeroed itself (FL_FROZEN, paused)
 		unsigned int interpDrops;       // cmds dropped by sv_rehlds_movecmd_clamp_interp
 		unsigned int budgetClamps;      // commands clipped by the movement-time budget
 		unsigned int stallImmuneSkipped; // slowmo warnings not accrued because a server stall was detected
