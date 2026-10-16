@@ -333,6 +333,7 @@ void CUserCmdTimeLimiter::ClientConnected(unsigned int clientId)
 #define BUDGET_REFILL_TOLERANCE 1.02 // budget refill speed relative to real time (client clock drift)
 #define RATE_EXCL_DEBT_AGE_MS 1000   // late client time for an excluded span is awaited this long at most
 #define LOSS_HEAVY_SHARE      0.8    // telemetry: share of a dump period excluded for packet loss that is logged
+#define CLIENT_FRAME_CAP_MSEC 250    // the client caps a frame at 250ms (Host_FilterTime), a longer one reports only that
 #define AIRSTUCK_MIN_MS       1000   // commands with no client time in them for this long are an air-stuck
 #define AIRSTUCK_CHUNK_MS     250    // the air-stuck span is judged in chunks of this much real time
 #define AIRSTUCK_BREAK_MS     2000   // a command silence this long ends the span: no commands, no evidence
@@ -573,6 +574,15 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		// interval that opened it, even with no client time to wait for
 		intervalValid = false;
 		reason = ust->exclFrameReason;
+	}
+	else if (ucmd->msec >= CLIENT_FRAME_CAP_MSEC && gapMs > ucmd->msec)
+	{
+		// A client below 4 fps: its frame took longer than the 250ms the
+		// client can report, the rest of the frame is lost on its side - lag,
+		// not slowmo. The rest of the server frame is not excluded with it,
+		// so capped commands packed together (a speedhack) stay measured.
+		intervalValid = false;
+		reason = EXCL_GAP;
 	}
 	else
 	{

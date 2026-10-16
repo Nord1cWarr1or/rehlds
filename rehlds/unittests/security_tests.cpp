@@ -116,6 +116,9 @@ struct movesim_params_t
 	// sv_rehlds_movecmd_max_null_streak for the run
 	int nullStreak;
 
+	// sv_rehlds_movecmdtime_min_scale for the run, 0 - keep the default
+	float minScale;
+
 	// air-stuck cheat: the client keeps sending commands with no time in
 	// them; with stuckTickEvery > 0 every that many-th command carries 1ms
 	// (dodges a plain zero-streak limit)
@@ -141,6 +144,7 @@ struct movesim_packet_t
 };
 
 extern cvar_t sv_rehlds_movecmd_max_null_streak;
+extern cvar_t sv_rehlds_movecmdtime_min_scale;
 
 static client_t s_simClients[MAX_CLIENTS];
 static edict_t s_simPlayer;
@@ -226,6 +230,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	double savedRealtime = realtime;
 	qboolean savedPaused = g_psv.paused;
 	float savedNullStreak = sv_rehlds_movecmd_max_null_streak.value;
+	float savedMinScale = sv_rehlds_movecmdtime_min_scale.value;
 
 	Q_memset(res, 0, sizeof(*res));
 	Q_memset(s_simClients, 0, sizeof(s_simClients));
@@ -238,6 +243,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	sv_player = &s_simPlayer;
 	g_psv.paused = FALSE;
 	sv_rehlds_movecmd_max_null_streak.value = (float)p->nullStreak;
+	if (p->minScale > 0.0f) {
+		sv_rehlds_movecmdtime_min_scale.value = p->minScale;
+	}
 	realtime = 1000.0;
 	g_UserCmdTimeLimiter.ClientConnected(0);
 
@@ -298,7 +306,8 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 			stuckCmds++;
 			msec = (p->stuckTickEvery > 0 && stuckCmds % p->stuckTickEvery == 0) ? 1 : 0;
 		} else {
-			msecCarry += frameSec * 1000.0 * p->speed;
+			// Host_FilterTime caps a client frame at 250ms
+			msecCarry += ((frameSec < 0.25) ? frameSec : 0.25) * 1000.0 * p->speed;
 			msec = (int)msecCarry;
 			if (msec > 255) msec = 255;
 			msecCarry -= msec;
@@ -355,6 +364,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	realtime = savedRealtime;
 	g_psv.paused = savedPaused;
 	sv_rehlds_movecmd_max_null_streak.value = savedNullStreak;
+	sv_rehlds_movecmdtime_min_scale.value = savedMinScale;
 }
 
 static void MoveSim_Check(const char *what, bool cond, const movesim_result_t *res)
@@ -695,6 +705,34 @@ TEST(MoveCmdTimeFrozenPulses, MoveCmdTime, 5000)
 	MoveSim_Check("frequent short freezes are counted as frozen", res.info.frozenCmds > 0, &res);
 	MoveSim_Check("frequent short freezes are not slowmo", res.info.detectSlow == 0 && res.info.rate > 0.95 && res.info.rate < 1.05, &res);
 	MoveSim_Check("frequent short freezes are not air-stuck", res.info.airstuckCount == 0, &res);
+}
+
+// a client running at 3 fps: each frame lasts 333ms but reports the 250ms
+// the client caps it at - the lost third is the client's lag, not slowmo
+TEST(MoveCmdTimeLowFpsClient, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.seconds = 90.0;
+	p.fps = 3;
+	p.cmdsPerPacket = 1;
+	p.minScale = 0.85f;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("a 3 fps client is not slowmo", res.info.detectSlow == 0, &res);
+}
+
+// a speedhack sending 255ms commands at full fps stays measurable
+TEST(MoveCmdTimeSpeedhack255, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.speed = 25.5;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("speedhack with 255ms commands is detected", res.info.detectSpeed > 0, &res);
 }
 
 TEST(MoveCmdTimeSlowmoCheat, MoveCmdTime, 5000)
