@@ -626,7 +626,7 @@ void SV_ClientViewRegister()
 
 qboolean SV_ClientViewActive(client_t *cl)
 {
-	if (sv_unlag_clientview.value == 0.0f || sv_unlag.value == 0.0f || cl->fakeclient || !(cl->lw && cl->lc))
+	if (sv_unlag_clientview.value == 0.0f || sv_unlag.value == 0.0f || cl->fakeclient || !SV_UnlagForClient(cl))
 		return FALSE;
 
 	return (g_eGameType == GT_CStrike || g_eGameType == GT_CZero) ? TRUE : FALSE;

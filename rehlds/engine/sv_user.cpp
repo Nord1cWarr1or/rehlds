@@ -1139,46 +1139,6 @@ int SV_ValidateClientCommand(char *pszCommand)
 	return 0;
 }
 
-// Returns the median of the valid (positive) latency samples.
-// Robust against jitter outliers: a single spike does not move the median.
-// For an even number of valid samples the average of the two central values is used.
-float SV_ComputeUnlagLatency(const float *samples, int count)
-{
-	float sorted[MAX_UNLAG_SAMPLES];
-	int numsamples = 0;
-
-	if (!samples || count <= 0)
-		return 0.0f;
-
-	for (int i = 0; i < count && numsamples < MAX_UNLAG_SAMPLES; i++)
-	{
-		if (samples[i] > 0.0f)
-			sorted[numsamples++] = samples[i];
-	}
-
-	if (!numsamples)
-		return 0.0f;
-
-	for (int i = 1; i < numsamples; i++)
-	{
-		float value = sorted[i];
-		int j = i - 1;
-
-		while (j >= 0 && sorted[j] > value)
-		{
-			sorted[j + 1] = sorted[j];
-			j--;
-		}
-
-		sorted[j + 1] = value;
-	}
-
-	if (numsamples & 1)
-		return sorted[numsamples / 2];
-
-	return (sorted[numsamples / 2 - 1] + sorted[numsamples / 2]) * 0.5f;
-}
-
 float SV_CalcClientTime(client_t *cl)
 {
 	float minping;
@@ -1197,27 +1157,6 @@ float SV_CalcClientTime(client_t *cl)
 
 	if (backtrack <= 0)
 		return 0.0f;
-
-#ifdef REHLDS_FIXES
-	// sv_unlagsamples > 1: median of the last N valid samples, no variance
-	// kill-switch. sv_unlagsamples 1 keeps the original behavior below.
-	if (backtrack > 1)
-	{
-		float samples[MAX_UNLAG_SAMPLES];
-		int numsamples = 0;
-
-		for (int i = 0; i < backtrack; i++)
-		{
-			client_frame_t *frame = &cl->frames[SV_UPDATE_MASK & (cl->netchan.incoming_acknowledged - i)];
-			if (frame->ping_time <= 0.0f)
-				continue;
-
-			samples[numsamples++] = frame->ping_time;
-		}
-
-		return SV_ComputeUnlagLatency(samples, numsamples);
-	}
-#endif // REHLDS_FIXES
 
 	for (int i = 0; i < backtrack; i++)
 	{
@@ -1260,6 +1199,18 @@ void SV_ComputeLatency(client_t *cl)
 	cl->latency = SV_CalcClientTime(cl);
 }
 
+// Whether the commands of a client are lag compensated: the client asks for
+// it with cl_lw 1 and cl_lc 1, sv_unlag 2 compensates every client.
+qboolean SV_UnlagForClient(const client_t *cl)
+{
+#ifdef REHLDS_FIXES
+	if (sv_unlag.value == 2.0f)
+		return TRUE;
+#endif
+
+	return (cl->lw && cl->lc) ? TRUE : FALSE;
+}
+
 int SV_UnlagCheckTeleport(vec_t *v1, vec_t *v2)
 {
 	for (int i = 0; i < 3; i++)
@@ -1273,7 +1224,7 @@ int SV_UnlagCheckTeleport(vec_t *v1, vec_t *v2)
 
 void SV_GetTrueOrigin(int player, vec_t *origin)
 {
-	if (!host_client->lw || !host_client->lc)
+	if (!SV_UnlagForClient(host_client))
 		return;
 
 	if (sv_unlag.value == 0 || g_psvs.maxclients <= 1 || !host_client->active)
@@ -1292,7 +1243,7 @@ void SV_GetTrueOrigin(int player, vec_t *origin)
 
 void SV_GetTrueMinMax(int player, float **fmin, float **fmax)
 {
-	if (!host_client->lw || !host_client->lc)
+	if (!SV_UnlagForClient(host_client))
 		return;
 
 	if (sv_unlag.value == 0.0f || g_psvs.maxclients <= 1)
@@ -1460,7 +1411,7 @@ void SV_UnlagTraceCmd(client_t *cl, const usercmd_t *ucmd, int random_seed)
 		"\"b\":%d,\"ms\":%d,\"lm\":%d,\"llm\":%d,\"nmi\":%.6f,\"age\":%.4f,\"o\":[%.3f,%.3f,%.3f],\"va\":[%.3f,%.3f],\"cv\":",
 		(int)(cl - g_psvs.clients), random_seed, realtime, g_psv.time,
 		cl->netchan.incoming_sequence, cl->netchan.incoming_acknowledged, ack->senttime,
-		cl->latency, (cl->lw && cl->lc) ? 1 : 0, (g_unlagTrace.valid && !nofind) ? 1 : 0,
+		cl->latency, SV_UnlagForClient(cl) ? 1 : 0, (g_unlagTrace.valid && !nofind) ? 1 : 0,
 		g_unlagTrace.targettime, g_unlagTrace.latency, g_unlagTrace.interp,
 		g_unlagTrace.nfseq, g_unlagTrace.fseq, g_unlagTrace.frac,
 		ucmd->buttons, ucmd->msec, ucmd->lerp_msec, cl->lastcmd.lerp_msec, cl->next_messageinterval, g_unlagCmdAge,
@@ -1547,7 +1498,7 @@ void SV_SetupMove(client_t *_host_client)
 	if (!gEntityInterface.pfnAllowLagCompensation())
 		return;
 
-	if (sv_unlag.value == 0.0f || !_host_client->lw || !_host_client->lc)
+	if (sv_unlag.value == 0.0f || !SV_UnlagForClient(_host_client))
 		return;
 
 	if (g_psvs.maxclients <= 1 || !_host_client->active)
@@ -1822,7 +1773,7 @@ void SV_RestoreMove(client_t *_host_client)
 	if (g_psvs.maxclients <= 1 || sv_unlag.value == 0.0)
 		return;
 
-	if (!_host_client->lw || !_host_client->lc || !_host_client->active)
+	if (!SV_UnlagForClient(_host_client) || !_host_client->active)
 		return;
 
 	for (int i = 0; i < g_psvs.maxclients; i++)

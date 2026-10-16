@@ -1,49 +1,35 @@
 #include "precompiled.h"
 #include "rehlds_tests_shared.h"
 #include "cppunitlite/TestHarness.h"
-#include "sv_user.h"
 
-const float UNLAG_LATENCY_EPS = 0.0001f;
+#ifdef REHLDS_FIXES
 
-TEST(UnlagLatency_EmptyInput, SvUnlag, 1000) {
-	DOUBLES_EQUAL("no samples", 0.0f, SV_ComputeUnlagLatency(NULL, 0), UNLAG_LATENCY_EPS);
-	DOUBLES_EQUAL("null pointer", 0.0f, SV_ComputeUnlagLatency(NULL, 5), UNLAG_LATENCY_EPS);
+TEST(UnlagForClient, SvUnlag, 1000) {
+	static client_t cl;
+	Q_memset(&cl, 0, sizeof(cl));
+	float saved = sv_unlag.value;
+
+	// sv_unlag 1: the client decides with cl_lw and cl_lc
+	sv_unlag.value = 1.0f;
+	cl.lw = TRUE; cl.lc = TRUE;
+	CHECK("lw 1 lc 1 compensated", SV_UnlagForClient(&cl));
+	cl.lc = FALSE;
+	CHECK("cl_lc 0 not compensated", !SV_UnlagForClient(&cl));
+	cl.lc = TRUE; cl.lw = FALSE;
+	CHECK("cl_lw 0 not compensated", !SV_UnlagForClient(&cl));
+
+	// other non-zero values keep behaving like 1
+	sv_unlag.value = 3.0f;
+	CHECK("sv_unlag 3 respects cl_lw 0", !SV_UnlagForClient(&cl));
+
+	// sv_unlag 2: every client, whatever it asks for
+	sv_unlag.value = 2.0f;
+	cl.lw = FALSE; cl.lc = FALSE;
+	CHECK("forced for cl_lw 0 cl_lc 0", SV_UnlagForClient(&cl));
+	cl.lw = TRUE;
+	CHECK("forced for cl_lc 0", SV_UnlagForClient(&cl));
+
+	sv_unlag.value = saved;
 }
 
-TEST(UnlagLatency_NoValidSamples, SvUnlag, 1001) {
-	float samples[] = { 0.0f, -0.5f, 0.0f };
-	DOUBLES_EQUAL("all invalid", 0.0f, SV_ComputeUnlagLatency(samples, 3), UNLAG_LATENCY_EPS);
-}
-
-TEST(UnlagLatency_SingleSample, SvUnlag, 1002) {
-	float samples[] = { 0.123f };
-	DOUBLES_EQUAL("single sample returned as is", 0.123f, SV_ComputeUnlagLatency(samples, 1), UNLAG_LATENCY_EPS);
-}
-
-TEST(UnlagLatency_MedianOddCount, SvUnlag, 1003) {
-	float samples[] = { 0.05f, 0.2f, 0.07f };
-	DOUBLES_EQUAL("odd count median", 0.07f, SV_ComputeUnlagLatency(samples, 3), UNLAG_LATENCY_EPS);
-}
-
-TEST(UnlagLatency_MedianEvenCount, SvUnlag, 1004) {
-	float samples[] = { 0.05f, 0.2f, 0.07f, 0.09f };
-	DOUBLES_EQUAL("even count median", 0.08f, SV_ComputeUnlagLatency(samples, 4), UNLAG_LATENCY_EPS);
-}
-
-TEST(UnlagLatency_OutlierRobustness, SvUnlag, 1005) {
-	float samples[] = { 0.05f, 0.05f, 0.5f, 0.05f, 0.05f, 0.05f, 0.05f, 0.05f };
-	DOUBLES_EQUAL("single spike does not move the median", 0.05f, SV_ComputeUnlagLatency(samples, 8), UNLAG_LATENCY_EPS);
-}
-
-TEST(UnlagLatency_InvalidSamplesSkipped, SvUnlag, 1006) {
-	float samples[] = { 0.0f, 0.1f, -1.0f, 0.3f };
-	DOUBLES_EQUAL("zeros and negatives skipped", 0.2f, SV_ComputeUnlagLatency(samples, 4), UNLAG_LATENCY_EPS);
-}
-
-TEST(UnlagLatency_InputCapped, SvUnlag, 1007) {
-	float samples[20];
-	for (int i = 0; i < 20; i++)
-		samples[i] = 0.01f * (i + 1);
-
-	DOUBLES_EQUAL("input capped at MAX_UNLAG_SAMPLES", 0.085f, SV_ComputeUnlagLatency(samples, 20), UNLAG_LATENCY_EPS);
-}
+#endif // REHLDS_FIXES

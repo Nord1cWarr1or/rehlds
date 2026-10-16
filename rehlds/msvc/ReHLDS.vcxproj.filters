@@ -323,6 +323,9 @@
     <ClCompile Include="..\unittests\clientview_tests.cpp">
       <Filter>unittests</Filter>
     </ClCompile>
+    <ClCompile Include="..\unittests\sv_unlag_tests.cpp">
+      <Filter>unittests</Filter>
+    </ClCompile>
     <ClCompile Include="..\unittests\security_tests.cpp">
       <Filter>unittests</Filter>
     </ClCompile>
