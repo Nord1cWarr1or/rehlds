@@ -19,6 +19,8 @@
 #include "precompiled.h"
 #include "sv_clientview.h"
 
+#ifdef REHLDS_FIXES
+
 // Client view emulation (sv_unlag_clientview 1).
 //
 // For every lag-compensated client the server replays, one client frame per
@@ -638,6 +640,7 @@ void SV_ClientViewSnapshot(client_t *cl, client_frame_t *frame)
 	cv_observer_t *cv = CV_Observer(cl);
 	int index = (frame - cl->frames) & SV_UPDATE_MASK;
 	cv->svtime[index] = g_psv.time;
+	cv->timebase = (sv_rehlds_local_gametime.value != 0.0f) ? g_GameClients[cl - g_psvs.clients]->GetLocalGameTimeBase() : 0.0;
 
 	Q_memset(cv->slot[index], 0xFF, sizeof(cv->slot[index]));
 	for (int i = 0; i < frame->entities.num_entities && i < 0xFF; i++)
@@ -650,9 +653,6 @@ void SV_ClientViewSnapshot(client_t *cl, client_frame_t *frame)
 		if (number > 0)
 			cv->slot[index][number] = (unsigned char)i;
 	}
-#ifdef REHLDS_FIXES
-	cv->timebase = (sv_rehlds_local_gametime.value != 0.0f) ? g_GameClients[cl - g_psvs.clients]->GetLocalGameTimeBase() : 0.0;
-#endif
 }
 
 void SV_ClientViewCvarValue(client_t *cl, int requestID, const char *value)
@@ -676,6 +676,12 @@ static double g_cvReadReal, g_cvReadSys;
 
 void SV_ClientViewReadPackets()
 {
+	if (sv_unlag_clientview.value == 0.0f)
+	{
+		g_cvReadSys = 0.0;
+		return;
+	}
+
 	g_cvReadReal = realtime;
 	g_cvReadSys = Sys_FloatTime();
 }
@@ -1011,3 +1017,5 @@ qboolean SV_ClientViewSetupBones(client_t *cl, const edict_t *edict, model_t *pM
 
 	return TRUE;
 }
+
+#endif // REHLDS_FIXES

@@ -22,6 +22,8 @@
 #include "studio.h"
 #include "entity_state.h"
 
+#ifdef REHLDS_FIXES
+
 // Client view emulation (sv_unlag_clientview), the parts that only replay
 // client-side rules and can be tested without a running server.
 
@@ -103,3 +105,5 @@ void CV_ProcessGait(cv_victim_t *v, studiohdr_t *phdr, float dt);
 
 // CStudioModelRenderer::StudioEstimateFrame
 double CV_EstimateFrame(const cv_victim_t *v, mstudioseqdesc_t *pseqdesc);
+
+#endif // REHLDS_FIXES

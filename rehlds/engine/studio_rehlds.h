@@ -60,7 +60,9 @@ extern rgStudioCache_t rgStudioCache;
 
 extern bonetransform_t bonetransform;
 
+#ifdef REHLDS_FIXES
 int SV_UnlagTraceHitboxes(const edict_t *pEdict, float (*out)[3], int maxout);
+#endif
 extern sv_blending_interface_t *g_pSvBlendingAPI;
 extern sv_blending_interface_t svBlending;
 extern server_studio_api_t server_studio_api;

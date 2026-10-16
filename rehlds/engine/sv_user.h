@@ -47,15 +47,15 @@ typedef struct sv_adjusted_positions_s
 	vec3_t initial_correction_org;
 	vec3_t oldabsmin;
 	vec3_t oldabsmax;
-	vec3_t oldmins;
-	vec3_t oldmaxs;
-	int oldusehull;
-	int hullswapped;
 	int deadflag;
 	vec3_t temp_org;
 	int temp_org_setflag;
 #ifdef REHLDS_FIXES
 	player_anim_state_t animstate;
+	vec3_t oldmins;
+	vec3_t oldmaxs;
+	int oldusehull;
+	int hullswapped;
 #endif
 } sv_adjusted_positions_t;
 
@@ -84,9 +84,11 @@ extern cvar_t sv_bone_unlag;
 extern cvar_t sv_maxunlag;
 extern cvar_t sv_unlagpush;
 extern cvar_t sv_unlagsamples;
+#ifdef REHLDS_FIXES
 extern cvar_t sv_unlaghull;
 extern cvar_t sv_unlag_trace;
 extern cvar_t sv_unlag_cmdage;
+#endif
 extern cvar_t mp_consistency;
 extern cvar_t sv_voiceenable;
 
@@ -110,8 +112,10 @@ void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd = FALSE, qbool
 int SV_ValidateClientCommand(char *pszCommand);
 float SV_CalcClientTime(client_t *cl);
 float SV_ComputeUnlagLatency(const float *samples, int count);
+#ifdef REHLDS_FIXES
 void SV_UnlagTraceSnapshot(client_t *client, client_frame_t *frame);
 void SV_UnlagTraceCmd(client_t *cl, const usercmd_t *ucmd, int random_seed);
+#endif
 void SV_ComputeLatency(client_t *cl);
 int SV_UnlagCheckTeleport(vec_t *v1, vec_t *v2);
 void SV_GetTrueOrigin(int player, vec_t *origin);
@@ -134,6 +138,7 @@ void SV_ShowServerinfo_f(void);
 void SV_SendEnts_f(void);
 void SV_FullUpdate_f(void);
 
+#ifdef REHLDS_FIXES
 // sv_clientview.cpp
 extern cvar_t sv_unlag_clientview;
 void SV_ClientViewRegister();
@@ -150,7 +155,6 @@ qboolean SV_ClientViewTraceTimes(client_t *cl, double *cltime, double *target, f
 const struct cv_victim_t *SV_ClientViewTraceVictim(client_t *cl, int number);
 qboolean SV_ClientViewSetupBones(client_t *cl, const edict_t *edict, model_t *pModel, const vec_t *origin);
 
-#ifdef REHLDS_FIXES
 qboolean SV_InStudioUnlagRewind(const edict_t *edict);
 void SV_StudioSetupUnlagBones(model_t *pModel, float frame, int sequence, const vec_t *angles, const vec_t *origin, const unsigned char *pcontroller, const unsigned char *pblending, int iBone, const edict_t *edict);
 #endif

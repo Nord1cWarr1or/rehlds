@@ -3,6 +3,8 @@
 #include "cppunitlite/TestHarness.h"
 #include "sv_clientview.h"
 
+#ifdef REHLDS_FIXES
+
 TEST(ClientAnimtime, ClientView, 1000) {
 	DOUBLES_EQUAL("whole centiseconds", 229.69, CV_ClientAnimtime(229.6937f, 0.0), 0.0001);
 	// the local gametime base shifts the centisecond grid
@@ -712,3 +714,5 @@ TEST(GaitIdleYawStuck, ClientView, 1000) {
 	ClientView_InitVictim(&v, -89.42f, 43.46f, -549.781f, 1000.438f, 548.031f, 1);
 	ClientView_CheckGait(&v, rows, ARRAYSIZE(rows));
 }
+
+#endif // REHLDS_FIXES

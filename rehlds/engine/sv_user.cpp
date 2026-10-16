@@ -61,6 +61,7 @@ cvar_t sv_bone_unlag = { "sv_bone_unlag", "0", 0, 0.0f, NULL };
 cvar_t sv_maxunlag = { "sv_maxunlag", "0.5", 0, 0.0f, NULL };
 cvar_t sv_unlagpush = { "sv_unlagpush", "0.0", 0, 0.0f, NULL };
 cvar_t sv_unlagsamples = { "sv_unlagsamples", "1", 0, 0.0f, NULL };
+#ifdef REHLDS_FIXES
 cvar_t sv_unlaghull = { "sv_unlaghull", "0", 0, 0.0f, NULL };
 cvar_t sv_unlag_trace = { "sv_unlag_trace", "0", 0, 0.0f, NULL };
 cvar_t sv_unlag_cmdage = { "sv_unlag_cmdage", "0", 0, 0.0f, NULL };
@@ -70,6 +71,7 @@ cvar_t sv_unlag_cmdage = { "sv_unlag_cmdage", "0", 0, 0.0f, NULL };
 // once when cl_cmdrate is below its fps; the older ones were made while it
 // rendered an older state, so their rewind has to go back that much further.
 static double g_unlagCmdAge = 0.0;
+#endif // REHLDS_FIXES
 cvar_t mp_consistency = { "mp_consistency", "1", FCVAR_SERVER, 0.0f, NULL };
 cvar_t sv_voiceenable = { "sv_voiceenable", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 0.0f, NULL };
 
@@ -488,6 +490,7 @@ void SV_CopyEdictToPhysent(physent_t *pe, int e, edict_t *check)
 		}
 	}
 
+#ifdef REHLDS_FIXES
 	if (e >= 1 && e <= g_psvs.maxclients && truepositions[e - 1].hullswapped)
 	{
 		// The entity hull is currently rewound for unlag hit checks; player
@@ -499,6 +502,7 @@ void SV_CopyEdictToPhysent(physent_t *pe, int e, edict_t *check)
 		pe->maxs[1] = truepositions[e - 1].oldmaxs[1];
 		pe->maxs[2] = truepositions[e - 1].oldmaxs[2];
 	}
+#endif
 
 	pe->skin = check->v.skin;
 	pe->frame = check->v.frame;
@@ -839,7 +843,9 @@ void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd, qboolean fCho
 	if (!host_client->fakeclient)
 	{
 		SV_SetupMove(host_client);
+#ifdef REHLDS_FIXES
 		SV_UnlagTraceCmd(host_client, ucmd, random_seed);
+#endif
 	}
 
 #ifdef REHLDS_FIXES
@@ -1192,6 +1198,7 @@ float SV_CalcClientTime(client_t *cl)
 	if (backtrack <= 0)
 		return 0.0f;
 
+#ifdef REHLDS_FIXES
 	// sv_unlagsamples > 1: median of the last N valid samples, no variance
 	// kill-switch. sv_unlagsamples 1 keeps the original behavior below.
 	if (backtrack > 1)
@@ -1210,6 +1217,7 @@ float SV_CalcClientTime(client_t *cl)
 
 		return SV_ComputeUnlagLatency(samples, numsamples);
 	}
+#endif // REHLDS_FIXES
 
 	for (int i = 0; i < backtrack; i++)
 	{
@@ -1314,6 +1322,7 @@ entity_state_t *SV_FindEntInPack(int index, packet_entities_t *pack)
 	return NULL;
 }
 
+#ifdef REHLDS_FIXES
 // Returns the duck hull state of entity 'entnum' recorded in the frame pair surrounding
 // targettime (nearest frame wins). Falls back to 'fallback' when the entity is missing
 // from both frames.
@@ -1507,6 +1516,7 @@ void SV_UnlagTraceCmd(client_t *cl, const usercmd_t *ucmd, int random_seed)
 	fputs("]", f);
 	SV_UnlagTraceEndLine(f);
 }
+#endif // REHLDS_FIXES
 
 void SV_SetupMove(client_t *_host_client)
 {
@@ -1530,7 +1540,9 @@ void SV_SetupMove(client_t *_host_client)
 #endif // REHLDS_FIXES
 
 	Q_memset(truepositions, 0, sizeof(truepositions));
+#ifdef REHLDS_FIXES
 	g_unlagTrace.valid = FALSE;
+#endif
 	nofind = 1;
 	if (!gEntityInterface.pfnAllowLagCompensation())
 		return;
@@ -1558,6 +1570,7 @@ void SV_SetupMove(client_t *_host_client)
 		truepositions[i].oldabsmax[1] = cl->edict->v.absmax[1];
 		truepositions[i].active = 1;
 		truepositions[i].oldabsmax[2] = cl->edict->v.absmax[2];
+#ifdef REHLDS_FIXES
 		truepositions[i].oldmins[0] = cl->edict->v.mins[0];
 		truepositions[i].oldmins[1] = cl->edict->v.mins[1];
 		truepositions[i].oldmins[2] = cl->edict->v.mins[2];
@@ -1565,6 +1578,7 @@ void SV_SetupMove(client_t *_host_client)
 		truepositions[i].oldmaxs[1] = cl->edict->v.maxs[1];
 		truepositions[i].oldmaxs[2] = cl->edict->v.maxs[2];
 		truepositions[i].oldusehull = (cl->edict->v.flags & FL_DUCKING) ? 1 : 0;
+#endif
 	}
 
 	float clientLatency = _host_client->latency;
@@ -1588,10 +1602,12 @@ void SV_SetupMove(client_t *_host_client)
 	if (_host_client->next_messageinterval > cl_interptime)
 		cl_interptime = (float) _host_client->next_messageinterval;
 
+#ifdef REHLDS_FIXES
 	// the latency estimate is anchored to the snapshot acked by the packet, which
 	// is what the newest command of the packet was built against
 	if (sv_unlag_cmdage.value != 0.0f)
 		cl_interptime += (float)g_unlagCmdAge;
+#endif
 
 #ifdef REHLDS_FIXES
 	// FP Precision fix (targettime is double there, not float)
@@ -1690,6 +1706,7 @@ void SV_SetupMove(client_t *_host_client)
 		frac = 0.0;
 	}
 
+#ifdef REHLDS_FIXES
 	if (sv_unlag_trace.value != 0.0f)
 	{
 		// nextFrame is outgoing_sequence + ~i, frame is the one sent right after it
@@ -1701,6 +1718,7 @@ void SV_SetupMove(client_t *_host_client)
 		g_unlagTrace.fseq = (frame == nextFrame) ? g_unlagTrace.nfseq : g_unlagTrace.nfseq + 1;
 		g_unlagTrace.frac = frac;
 	}
+#endif
 
 	for (i = 0; i < nextFrame->entities.num_entities; i++)
 	{
@@ -1746,9 +1764,11 @@ void SV_SetupMove(client_t *_host_client)
 			origin[2] = state->origin[2];
 		}
 
+#ifdef REHLDS_FIXES
 		// sv_unlag_clientview: exactly where (and in which stance) the client drew it
 		int cvhull;
 		qboolean cvdrawn = SV_ClientViewOrigin(_host_client, state->number, origin, &cvhull);
+#endif
 
 		pos->neworg[0] = origin[0];
 		pos->neworg[1] = origin[1];
@@ -1757,6 +1777,7 @@ void SV_SetupMove(client_t *_host_client)
 		pos->initial_correction_org[1] = origin[1];
 		pos->initial_correction_org[2] = origin[2];
 
+#ifdef REHLDS_FIXES
 		// Optionally rewind the duck hull together with the origin (sv_unlaghull)
 		int usehull = pos->oldusehull;
 		if (cvdrawn)
@@ -1771,6 +1792,9 @@ void SV_SetupMove(client_t *_host_client)
 		}
 
 		if (!VectorCompare(origin, cl->edict->v.origin) || pos->hullswapped)
+#else
+		if (!VectorCompare(origin, cl->edict->v.origin))
+#endif
 		{
 			cl->edict->v.origin[0] = origin[0];
 			cl->edict->v.origin[1] = origin[1];
@@ -1809,7 +1833,12 @@ void SV_RestoreMove(client_t *_host_client)
 		if (cli == _host_client ||! cli->active)
 			continue;
 
+#ifdef REHLDS_FIXES
+		// a victim with the same origin may still carry a rewound hull
 		if (!pos->needrelink)
+#else
+		if (VectorCompare(pos->neworg, pos->oldorg) || !pos->needrelink)
+#endif
 			continue;
 
 		if (!pos->active)
@@ -1818,6 +1847,7 @@ void SV_RestoreMove(client_t *_host_client)
 			continue;
 		}
 
+#ifdef REHLDS_FIXES
 		if (pos->hullswapped)
 		{
 			// A victim must never keep a foreign hull, restore it even if the
@@ -1827,7 +1857,6 @@ void SV_RestoreMove(client_t *_host_client)
 			SV_LinkEdict(cli->edict, FALSE);
 		}
 
-#ifdef REHLDS_FIXES
 		pos->animstate.valid = false;
 #endif
 
@@ -2061,6 +2090,7 @@ void SV_ParseMove(client_t *pSenderClient)
 #endif
 	SV_EstablishTimeBase(host_client, cmds, net_drop, numbackup, numcmds);
 
+#ifdef REHLDS_FIXES
 	// cmds[0] is the newest command, every older one was built msec earlier
 	double cmdages[CMD_MAXBACKUP];
 	double cmdage = 0.0;
@@ -2089,21 +2119,26 @@ void SV_ParseMove(client_t *pSenderClient)
 
 		SV_ClientViewPacket(host_client, cmds[0].msec, oldermsec);
 	}
+#endif // REHLDS_FIXES
 
 	if (net_drop < 24)
 	{
 		while (net_drop > numbackup)
 		{
+#ifdef REHLDS_FIXES
 			g_unlagCmdAge = cmdage;
 			SV_ClientViewFrame(host_client, g_unlagCmdAge, &host_client->lastcmd);
+#endif
 			SV_RunCmd(&host_client->lastcmd, 0, FALSE);
 			net_drop--;
 		}
 
 		while (net_drop > 0)
 		{
+#ifdef REHLDS_FIXES
 			g_unlagCmdAge = cmdages[numcmds + net_drop - 1];
 			SV_ClientViewFrame(host_client, g_unlagCmdAge, &cmds[numcmds + net_drop - 1]);
+#endif
 			SV_RunCmd(&cmds[numcmds + net_drop - 1], host_client->netchan.incoming_sequence - (numcmds + net_drop - 1), TRUE);
 			net_drop--;
 		}
@@ -2112,14 +2147,16 @@ void SV_ParseMove(client_t *pSenderClient)
 
 	for (int i = numcmds - 1; i >= 0; i--)
 	{
+#ifdef REHLDS_FIXES
 		g_unlagCmdAge = cmdages[i];
 		SV_ClientViewFrame(host_client, g_unlagCmdAge, &cmds[i]);
+#endif
 		SV_RunCmd(&cmds[i], host_client->netchan.incoming_sequence - i, TRUE);
 	}
 
+#ifdef REHLDS_FIXES
 	g_unlagCmdAge = 0.0;
 
-#ifdef REHLDS_FIXES
 	// skip if client dropped while executing commands
 	if (!host_client->connected)
 		return;
@@ -2205,11 +2242,13 @@ void SV_ParseCvarValue2(client_t *cl)
 
 	char* value = MSG_ReadString();
 
+#ifdef REHLDS_FIXES
 	if (SV_ClientViewIsQuery(requestID))
 	{
 		SV_ClientViewCvarValue(cl, requestID, value);
 		return;
 	}
+#endif
 
 	if (gNewDLLFunctions.pfnCvarValue2)
 		gNewDLLFunctions.pfnCvarValue2(cl->edict, requestID, cvarName, value);

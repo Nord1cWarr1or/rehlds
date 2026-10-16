@@ -684,6 +684,7 @@ hull_t *R_StudioHull(model_t *pModel, float frame, int sequence, const vec_t *an
 	return &studio_hull[0];
 }
 
+#ifdef REHLDS_FIXES
 // Unlag trace: world-space centers of the hitboxes a point trace against this
 // player would build right now. Same inputs as the player branch of
 // SV_HullForStudioModel, so inside a rewind window the result includes the
@@ -705,7 +706,6 @@ int SV_UnlagTraceHitboxes(const edict_t *pEdict, float (*out)[3], int maxout)
 
 	unsigned char blending[2];
 	unsigned char controller[4];
-#ifdef REHLDS_FIXES
 	if (sv_bone_unlag.value != 0.0f && pseqdesc->numblends != 9)
 	{
 		blending[0] = pEdict->v.blending[0];
@@ -713,7 +713,6 @@ int SV_UnlagTraceHitboxes(const edict_t *pEdict, float (*out)[3], int maxout)
 		Q_memcpy(controller, pEdict->v.controller, sizeof(controller));
 	}
 	else
-#endif
 	{
 		int iBlend;
 		R_StudioPlayerBlend(pseqdesc, &iBlend, angles);
@@ -723,11 +722,7 @@ int SV_UnlagTraceHitboxes(const edict_t *pEdict, float (*out)[3], int maxout)
 	}
 
 	vec_t angles2[3] = { -angles[0], angles[1], angles[2] };
-#ifdef REHLDS_FIXES
 	SV_StudioSetupUnlagBones(pModel, pEdict->v.frame, pEdict->v.sequence, angles2, pEdict->v.origin, controller, blending, -1, pEdict);
-#else
-	g_pSvBlendingAPI->SV_StudioSetupBones(pModel, pEdict->v.frame, pEdict->v.sequence, angles2, pEdict->v.origin, controller, blending, -1, pEdict);
-#endif
 
 	mstudiobbox_t *pbbox = (mstudiobbox_t *)((char *)phdr + phdr->hitboxindex);
 	int count = Q_min(phdr->numhitboxes, maxout);
@@ -742,6 +737,7 @@ int SV_UnlagTraceHitboxes(const edict_t *pEdict, float (*out)[3], int maxout)
 
 	return count;
 }
+#endif // REHLDS_FIXES
 
 int SV_HitgroupForStudioHull(int index)
 {
@@ -861,10 +857,10 @@ hull_t *SV_HullForStudioModel(const edict_t *pEdict, const vec_t *mins, const ve
 			angles[1] = pEdict->v.angles[1];
 			angles[2] = pEdict->v.angles[2];
 
-#ifdef REHLDS_FIXES
 			unsigned char blending[2];
 			unsigned char controller[4];
 
+#ifdef REHLDS_FIXES
 			// R_StudioPlayerBlend is only valid for nine-way movement blends.
 			// Other sequences (reload, duck, C4 plant, longjump) carry their
 			// blending in the networked entity fields: use them so the traced
