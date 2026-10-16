@@ -27,6 +27,7 @@
 */
 
 #include "precompiled.h"
+#include "sv_clientview.h"
 
 sv_adjusted_positions_t truepositions[MAX_CLIENTS];
 qboolean g_balreadymoved;
@@ -61,6 +62,14 @@ cvar_t sv_maxunlag = { "sv_maxunlag", "0.5", 0, 0.0f, NULL };
 cvar_t sv_unlagpush = { "sv_unlagpush", "0.0", 0, 0.0f, NULL };
 cvar_t sv_unlagsamples = { "sv_unlagsamples", "1", 0, 0.0f, NULL };
 cvar_t sv_unlaghull = { "sv_unlaghull", "0", 0, 0.0f, NULL };
+cvar_t sv_unlag_trace = { "sv_unlag_trace", "0", 0, 0.0f, NULL };
+cvar_t sv_unlag_cmdage = { "sv_unlag_cmdage", "0", 0, 0.0f, NULL };
+
+// Time between the creation of the command being run and the newest command
+// of its packet. The client builds one command per frame and sends several at
+// once when cl_cmdrate is below its fps; the older ones were made while it
+// rendered an older state, so their rewind has to go back that much further.
+static double g_unlagCmdAge = 0.0;
 cvar_t mp_consistency = { "mp_consistency", "1", FCVAR_SERVER, 0.0f, NULL };
 cvar_t sv_voiceenable = { "sv_voiceenable", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 0.0f, NULL };
 
@@ -828,7 +837,10 @@ void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd, qboolean fCho
 	}
 
 	if (!host_client->fakeclient)
+	{
 		SV_SetupMove(host_client);
+		SV_UnlagTraceCmd(host_client, ucmd, random_seed);
+	}
 
 #ifdef REHLDS_FIXES
 	if (sv_usercmd_custom_random_seed.value)
@@ -1343,6 +1355,159 @@ static int SV_FrameUseHull(client_frame_t *first, client_frame_t *second, double
 	return fallback;
 }
 
+// Unlag trace (sv_unlag_trace 1): JSON lines in <gamedir>/unlag_trace.jsonl.
+// "S" - player states of every snapshot built for a client, "C" - the rewind
+// done for every command of a client. Commands carry their random_seed, which
+// is the client's outgoing sequence of that command, so a client-side log of
+// what was rendered joins on it.
+struct unlag_trace_info_t
+{
+	qboolean valid;
+	double targettime;
+	float latency;
+	float interp;
+	int nfseq;
+	int fseq;
+	float frac;
+};
+
+static unlag_trace_info_t g_unlagTrace;
+static FILE *g_unlagTraceFile = NULL;
+static unsigned int g_unlagTraceLines = 0;
+
+static FILE *SV_UnlagTraceFile()
+{
+	if (sv_unlag_trace.value == 0.0f)
+	{
+		if (g_unlagTraceFile)
+		{
+			fclose(g_unlagTraceFile);
+			g_unlagTraceFile = NULL;
+		}
+
+		return NULL;
+	}
+
+	if (!g_unlagTraceFile)
+	{
+		char path[MAX_PATH];
+		Q_snprintf(path, sizeof(path), "%s/unlag_trace.jsonl", com_gamedir);
+		g_unlagTraceFile = fopen(path, "a");
+	}
+
+	return g_unlagTraceFile;
+}
+
+static void SV_UnlagTraceEndLine(FILE *f)
+{
+	fputs("}\n", f);
+
+	if (++g_unlagTraceLines % 256 == 0)
+		fflush(f);
+}
+
+void SV_UnlagTraceSnapshot(client_t *client, client_frame_t *frame)
+{
+	FILE *f;
+
+	if (client->fakeclient || !(f = SV_UnlagTraceFile()))
+		return;
+
+	fprintf(f, "{\"t\":\"S\",\"c\":%d,\"q\":%d,\"rt\":%.6f,\"st\":%.6f,\"lb\":%.6f,\"p\":[",
+		(int)(client - g_psvs.clients), client->netchan.outgoing_sequence, realtime, g_psv.time,
+		sv_rehlds_local_gametime.value != 0.0f ? g_GameClients[client - g_psvs.clients]->GetLocalGameTimeBase() : 0.0);
+
+	bool first = true;
+	for (int i = 0; i < frame->entities.num_entities; i++)
+	{
+		entity_state_t *s = &frame->entities.entities[i];
+		if (s->number <= 0 || s->number > g_psvs.maxclients)
+			continue;
+
+		edict_t *ent = &g_psv.edicts[s->number];
+		fprintf(f, "%s[%d,%.3f,%.3f,%.3f,%.4f,%d,%d,%.2f,%.2f,%.2f,%d,%d,%d]", first ? "" : ",",
+			s->number, s->origin[0], s->origin[1], s->origin[2], s->animtime,
+			s->sequence, s->gaitsequence, s->frame, s->angles[0], s->angles[1],
+			(ent->v.flags & FL_DUCKING) ? 1 : 0, s->blending[0], s->blending[1]);
+		first = false;
+	}
+
+	fputs("]", f);
+	SV_UnlagTraceEndLine(f);
+}
+
+// Called right after SV_SetupMove: edict origins of the other players are the
+// rewound ones (if a rewind happened), truepositions keep the real ones.
+void SV_UnlagTraceCmd(client_t *cl, const usercmd_t *ucmd, int random_seed)
+{
+	FILE *f;
+
+	if (cl->fakeclient || !(f = SV_UnlagTraceFile()))
+		return;
+
+	client_frame_t *ack = &cl->frames[SV_UPDATE_MASK & cl->netchan.incoming_acknowledged];
+	fprintf(f, "{\"t\":\"C\",\"c\":%d,\"sd\":%d,\"rt\":%.6f,\"st\":%.6f,\"in\":%d,\"ack\":%d,\"ackrt\":%.6f,"
+		"\"lat\":%.6f,\"lclw\":%d,\"rw\":%d,\"tt\":%.6f,\"tl\":%.6f,\"ip\":%.5f,\"nf\":%d,\"fq\":%d,\"fr\":%.4f,"
+		"\"b\":%d,\"ms\":%d,\"lm\":%d,\"llm\":%d,\"nmi\":%.6f,\"age\":%.4f,\"o\":[%.3f,%.3f,%.3f],\"va\":[%.3f,%.3f],\"cv\":",
+		(int)(cl - g_psvs.clients), random_seed, realtime, g_psv.time,
+		cl->netchan.incoming_sequence, cl->netchan.incoming_acknowledged, ack->senttime,
+		cl->latency, (cl->lw && cl->lc) ? 1 : 0, (g_unlagTrace.valid && !nofind) ? 1 : 0,
+		g_unlagTrace.targettime, g_unlagTrace.latency, g_unlagTrace.interp,
+		g_unlagTrace.nfseq, g_unlagTrace.fseq, g_unlagTrace.frac,
+		ucmd->buttons, ucmd->msec, ucmd->lerp_msec, cl->lastcmd.lerp_msec, cl->next_messageinterval, g_unlagCmdAge,
+		cl->edict->v.origin[0], cl->edict->v.origin[1], cl->edict->v.origin[2],
+		ucmd->viewangles[0], ucmd->viewangles[1]);
+
+	// sv_unlag_clientview: the replayed render (client clock, interpolation target, interp)
+	double cvclock, cvtarget;
+	float cvinterp;
+	if (SV_ClientViewTraceTimes(cl, &cvclock, &cvtarget, &cvinterp))
+		fprintf(f, "[%.6f,%.6f,%.5f]", cvclock, cvtarget, cvinterp);
+	else
+		fputs("null", f);
+
+	fputs(",\"v\":[", f);
+
+	bool first = true;
+	for (int i = 0; i < g_psvs.maxclients; i++)
+	{
+		client_t *other = &g_psvs.clients[i];
+		if (other == cl || !other->active)
+			continue;
+
+		sv_adjusted_positions_t *pos = &truepositions[i];
+		const vec_t *now = other->edict->v.origin;
+		const vec_t *real = pos->active ? pos->oldorg : now;
+
+		fprintf(f, "%s[%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,[", first ? "" : ",", i + 1,
+			now[0], now[1], now[2], real[0], real[1], real[2],
+			pos->needrelink ? 1 : 0, pos->deadflag ? 1 : 0, (int)other->edict->v.maxs[2],
+			other->edict->v.sequence, other->edict->v.gaitsequence, other->edict->v.frame);
+
+		// hitbox centers as a point trace (knife stage one, bullets) sees them now
+		float hb[32][3];
+		int numhb = SV_UnlagTraceHitboxes(other->edict, hb, ARRAYSIZE(hb));
+		for (int h = 0; h < numhb; h++)
+			fprintf(f, "%s%.2f,%.2f,%.2f", h ? "," : "", hb[h][0], hb[h][1], hb[h][2]);
+
+		fputs("]", f);
+
+		// the emulated client pose of this player, when it was drawn
+		const cv_victim_t *cv = SV_ClientViewTraceVictim(cl, i + 1);
+		if (cv)
+		{
+			fprintf(f, ",[%.2f,%.3f,%d,%d,%d,%d,%d,%.3f]", cv->gaityaw, cv->gaitframe, cv->blending[0], cv->blending[1],
+				cv->sequence, cv->gaitsequence, cv->usehull, cv->yawmodifier);
+		}
+
+		fputs("]", f);
+		first = false;
+	}
+
+	fputs("]", f);
+	SV_UnlagTraceEndLine(f);
+}
+
 void SV_SetupMove(client_t *_host_client)
 {
 	struct client_s *cl;
@@ -1365,6 +1530,7 @@ void SV_SetupMove(client_t *_host_client)
 #endif // REHLDS_FIXES
 
 	Q_memset(truepositions, 0, sizeof(truepositions));
+	g_unlagTrace.valid = FALSE;
 	nofind = 1;
 	if (!gEntityInterface.pfnAllowLagCompensation())
 		return;
@@ -1421,6 +1587,11 @@ void SV_SetupMove(client_t *_host_client)
 
 	if (_host_client->next_messageinterval > cl_interptime)
 		cl_interptime = (float) _host_client->next_messageinterval;
+
+	// the latency estimate is anchored to the snapshot acked by the packet, which
+	// is what the newest command of the packet was built against
+	if (sv_unlag_cmdage.value != 0.0f)
+		cl_interptime += (float)g_unlagCmdAge;
 
 #ifdef REHLDS_FIXES
 	// FP Precision fix (targettime is double there, not float)
@@ -1519,6 +1690,18 @@ void SV_SetupMove(client_t *_host_client)
 		frac = 0.0;
 	}
 
+	if (sv_unlag_trace.value != 0.0f)
+	{
+		// nextFrame is outgoing_sequence + ~i, frame is the one sent right after it
+		g_unlagTrace.valid = TRUE;
+		g_unlagTrace.targettime = targettime;
+		g_unlagTrace.latency = clientLatency;
+		g_unlagTrace.interp = cl_interptime;
+		g_unlagTrace.nfseq = _host_client->netchan.outgoing_sequence - 1 - i;
+		g_unlagTrace.fseq = (frame == nextFrame) ? g_unlagTrace.nfseq : g_unlagTrace.nfseq + 1;
+		g_unlagTrace.frac = frac;
+	}
+
 	for (i = 0; i < nextFrame->entities.num_entities; i++)
 	{
 		state = &nextFrame->entities.entities[i];
@@ -1562,6 +1745,11 @@ void SV_SetupMove(client_t *_host_client)
 			origin[1] = state->origin[1];
 			origin[2] = state->origin[2];
 		}
+
+		// sv_unlag_clientview: exactly where (and in which stance) the client drew it
+		int cvhull;
+		qboolean cvdrawn = SV_ClientViewOrigin(_host_client, state->number, origin, &cvhull);
+
 		pos->neworg[0] = origin[0];
 		pos->neworg[1] = origin[1];
 		pos->neworg[2] = origin[2];
@@ -1571,7 +1759,9 @@ void SV_SetupMove(client_t *_host_client)
 
 		// Optionally rewind the duck hull together with the origin (sv_unlaghull)
 		int usehull = pos->oldusehull;
-		if (sv_unlaghull.value != 0.0f)
+		if (cvdrawn)
+			usehull = cvhull;
+		else if (sv_unlaghull.value != 0.0f)
 			usehull = SV_FrameUseHull(frame, nextFrame, targettime, state->number, pos->oldusehull);
 
 		if (usehull != pos->oldusehull)
@@ -1870,16 +2060,50 @@ void SV_ParseMove(client_t *pSenderClient)
 	sv_player->v.light_level = cmds[0].lightlevel;
 #endif
 	SV_EstablishTimeBase(host_client, cmds, net_drop, numbackup, numcmds);
+
+	// cmds[0] is the newest command, every older one was built msec earlier
+	double cmdages[CMD_MAXBACKUP];
+	double cmdage = 0.0;
+	for (int i = 0; i < totalcmds; i++)
+	{
+		cmdages[i] = cmdage;
+		cmdage += cmds[i].msec / 1000.0;
+	}
+
+	// sv_unlag_clientview: the frames the client ran since its previous
+	// packet, the new commands and the ones recovered for dropped packets
+	if (numcmds > 0)
+	{
+		int oldermsec = 0;
+		for (int i = 1; i < numcmds; i++)
+			oldermsec += cmds[i].msec;
+
+		if (net_drop > 0 && net_drop < 24)
+		{
+			for (int i = 0; i < net_drop && i < numbackup; i++)
+				oldermsec += cmds[numcmds + i].msec;
+
+			if (net_drop > numbackup)
+				oldermsec += (net_drop - numbackup) * host_client->lastcmd.msec;
+		}
+
+		SV_ClientViewPacket(host_client, cmds[0].msec, oldermsec);
+	}
+
 	if (net_drop < 24)
 	{
 		while (net_drop > numbackup)
 		{
+			g_unlagCmdAge = cmdage;
+			SV_ClientViewFrame(host_client, g_unlagCmdAge, &host_client->lastcmd);
 			SV_RunCmd(&host_client->lastcmd, 0, FALSE);
 			net_drop--;
 		}
 
 		while (net_drop > 0)
 		{
+			g_unlagCmdAge = cmdages[numcmds + net_drop - 1];
+			SV_ClientViewFrame(host_client, g_unlagCmdAge, &cmds[numcmds + net_drop - 1]);
 			SV_RunCmd(&cmds[numcmds + net_drop - 1], host_client->netchan.incoming_sequence - (numcmds + net_drop - 1), TRUE);
 			net_drop--;
 		}
@@ -1888,8 +2112,12 @@ void SV_ParseMove(client_t *pSenderClient)
 
 	for (int i = numcmds - 1; i >= 0; i--)
 	{
+		g_unlagCmdAge = cmdages[i];
+		SV_ClientViewFrame(host_client, g_unlagCmdAge, &cmds[i]);
 		SV_RunCmd(&cmds[i], host_client->netchan.incoming_sequence - i, TRUE);
 	}
+
+	g_unlagCmdAge = 0.0;
 
 #ifdef REHLDS_FIXES
 	// skip if client dropped while executing commands
@@ -1976,6 +2204,12 @@ void SV_ParseCvarValue2(client_t *cl)
 	cvarName[sizeof(cvarName) - 1] = 0;
 
 	char* value = MSG_ReadString();
+
+	if (SV_ClientViewIsQuery(requestID))
+	{
+		SV_ClientViewCvarValue(cl, requestID, value);
+		return;
+	}
 
 	if (gNewDLLFunctions.pfnCvarValue2)
 		gNewDLLFunctions.pfnCvarValue2(cl->edict, requestID, cvarName, value);
@@ -2186,7 +2420,21 @@ void SV_FullUpdate_f(void)
 }
 
 #ifdef REHLDS_FIXES
-qboolean SV_InStudioUnlagRewind(const edict_t *edict)
+// Inside the rewind window of host_client, is this player the client view
+// emulation's? Its bones then come from SV_ClientViewSetupBones.
+static qboolean SV_InClientViewRewind(const edict_t *edict)
+{
+	if (!edict || nofind != 0 || !host_client || !(edict->v.flags & FL_CLIENT))
+		return FALSE;
+
+	int num = NUM_FOR_EDICT(edict) - 1;
+	if (num < 0 || num >= MAX_CLIENTS || !truepositions[num].active)
+		return FALSE;
+
+	return SV_ClientViewHasPose(host_client, edict);
+}
+
+static qboolean SV_InBoneUnlagRewind(const edict_t *edict)
 {
 	if (!edict || sv_bone_unlag.value == 0.0f || nofind != 0)
 		return FALSE;
@@ -2203,14 +2451,24 @@ qboolean SV_InStudioUnlagRewind(const edict_t *edict)
 		truepositions[num].animstate.valid;
 }
 
+// The studio hull cache is keyed on live entity fields, both rewinds build
+// bones from something else
+qboolean SV_InStudioUnlagRewind(const edict_t *edict)
+{
+	return SV_InClientViewRewind(edict) || SV_InBoneUnlagRewind(edict);
+}
+
 void SV_StudioSetupUnlagBones(model_t *pModel, float frame, int sequence, const vec_t *angles, const vec_t *origin, const unsigned char *pcontroller, const unsigned char *pblending, int iBone, const edict_t *edict)
 {
+	if (SV_InClientViewRewind(edict) && SV_ClientViewSetupBones(host_client, edict, pModel, origin))
+		return;
+
 	// During the lag-compensation window (nofind == 0) recompute the target's
 	// bones from the animation inputs captured in the shooter's snapshot that
 	// the position rewind is based on. Only applies when the position was
 	// actually rewound (needrelink); otherwise current bones already match
 	// what the shooter sees.
-	if (SV_InStudioUnlagRewind(edict))
+	if (SV_InBoneUnlagRewind(edict))
 	{
 		int num = NUM_FOR_EDICT(edict) - 1;
 		vec3_t angles2;

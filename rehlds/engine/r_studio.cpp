@@ -684,6 +684,65 @@ hull_t *R_StudioHull(model_t *pModel, float frame, int sequence, const vec_t *an
 	return &studio_hull[0];
 }
 
+// Unlag trace: world-space centers of the hitboxes a point trace against this
+// player would build right now. Same inputs as the player branch of
+// SV_HullForStudioModel, so inside a rewind window the result includes the
+// rewound origin (and the bone-unlag pose when it is enabled).
+int SV_UnlagTraceHitboxes(const edict_t *pEdict, float (*out)[3], int maxout)
+{
+	model_t *pModel = g_psv.models[pEdict->v.modelindex];
+	if (!pModel || pModel->type != mod_studio || !(pEdict->v.flags & FL_CLIENT))
+		return 0;
+
+	studiohdr_t *phdr = (studiohdr_t *)Mod_Extradata(pModel);
+	if (!phdr || pEdict->v.sequence < 0 || pEdict->v.sequence >= phdr->numseq)
+		return 0;
+
+	mstudioseqdesc_t *pseqdesc = (mstudioseqdesc_t *)((char *)phdr + phdr->seqindex) + pEdict->v.sequence;
+
+	vec3_t angles;
+	VectorCopy(pEdict->v.angles, angles);
+
+	unsigned char blending[2];
+	unsigned char controller[4];
+#ifdef REHLDS_FIXES
+	if (sv_bone_unlag.value != 0.0f && pseqdesc->numblends != 9)
+	{
+		blending[0] = pEdict->v.blending[0];
+		blending[1] = pEdict->v.blending[1];
+		Q_memcpy(controller, pEdict->v.controller, sizeof(controller));
+	}
+	else
+#endif
+	{
+		int iBlend;
+		R_StudioPlayerBlend(pseqdesc, &iBlend, angles);
+		blending[0] = (unsigned char)iBlend;
+		blending[1] = 0;
+		controller[0] = controller[1] = controller[2] = controller[3] = 0x7F;
+	}
+
+	vec_t angles2[3] = { -angles[0], angles[1], angles[2] };
+#ifdef REHLDS_FIXES
+	SV_StudioSetupUnlagBones(pModel, pEdict->v.frame, pEdict->v.sequence, angles2, pEdict->v.origin, controller, blending, -1, pEdict);
+#else
+	g_pSvBlendingAPI->SV_StudioSetupBones(pModel, pEdict->v.frame, pEdict->v.sequence, angles2, pEdict->v.origin, controller, blending, -1, pEdict);
+#endif
+
+	mstudiobbox_t *pbbox = (mstudiobbox_t *)((char *)phdr + phdr->hitboxindex);
+	int count = Q_min(phdr->numhitboxes, maxout);
+	for (int i = 0; i < count; i++)
+	{
+		vec3_t mid;
+		for (int k = 0; k < 3; k++)
+			mid[k] = (pbbox[i].bbmin[k] + pbbox[i].bbmax[k]) * 0.5f;
+
+		VectorTransform(mid, bonetransform[pbbox[i].bone], out[i]);
+	}
+
+	return count;
+}
+
 int SV_HitgroupForStudioHull(int index)
 {
 	return studio_hull_hitgroup[index];

@@ -85,6 +85,8 @@ extern cvar_t sv_maxunlag;
 extern cvar_t sv_unlagpush;
 extern cvar_t sv_unlagsamples;
 extern cvar_t sv_unlaghull;
+extern cvar_t sv_unlag_trace;
+extern cvar_t sv_unlag_cmdage;
 extern cvar_t mp_consistency;
 extern cvar_t sv_voiceenable;
 
@@ -108,6 +110,8 @@ void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd = FALSE, qbool
 int SV_ValidateClientCommand(char *pszCommand);
 float SV_CalcClientTime(client_t *cl);
 float SV_ComputeUnlagLatency(const float *samples, int count);
+void SV_UnlagTraceSnapshot(client_t *client, client_frame_t *frame);
+void SV_UnlagTraceCmd(client_t *cl, const usercmd_t *ucmd, int random_seed);
 void SV_ComputeLatency(client_t *cl);
 int SV_UnlagCheckTeleport(vec_t *v1, vec_t *v2);
 void SV_GetTrueOrigin(int player, vec_t *origin);
@@ -129,6 +133,22 @@ qboolean SV_SetPlayer(int idnum);
 void SV_ShowServerinfo_f(void);
 void SV_SendEnts_f(void);
 void SV_FullUpdate_f(void);
+
+// sv_clientview.cpp
+extern cvar_t sv_unlag_clientview;
+void SV_ClientViewRegister();
+qboolean SV_ClientViewActive(client_t *cl);
+void SV_ClientViewSnapshot(client_t *cl, client_frame_t *frame);
+void SV_ClientViewReadPackets();
+void SV_ClientViewPacket(client_t *cl, int newestmsec, int oldermsec);
+void SV_ClientViewFrame(client_t *cl, double cmdage, const usercmd_t *cmd);
+qboolean SV_ClientViewIsQuery(int requestID);
+void SV_ClientViewCvarValue(client_t *cl, int requestID, const char *value);
+qboolean SV_ClientViewOrigin(client_t *cl, int number, vec_t *origin, int *usehull);
+qboolean SV_ClientViewHasPose(client_t *cl, const edict_t *edict);
+qboolean SV_ClientViewTraceTimes(client_t *cl, double *cltime, double *target, float *interp);
+const struct cv_victim_t *SV_ClientViewTraceVictim(client_t *cl, int number);
+qboolean SV_ClientViewSetupBones(client_t *cl, const edict_t *edict, model_t *pModel, const vec_t *origin);
 
 #ifdef REHLDS_FIXES
 qboolean SV_InStudioUnlagRewind(const edict_t *edict);

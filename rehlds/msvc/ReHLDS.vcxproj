@@ -75,6 +75,7 @@
     <ClCompile Include="..\engine\sv_steam3.cpp" />
     <ClCompile Include="..\engine\sv_upld.cpp" />
     <ClCompile Include="..\engine\sv_user.cpp" />
+    <ClCompile Include="..\engine\sv_clientview.cpp" />
     <ClCompile Include="..\engine\SystemWrapper.cpp" />
     <ClCompile Include="..\engine\sys_dll.cpp" />
     <ClCompile Include="..\engine\sys_dll2.cpp" />
@@ -184,6 +185,12 @@
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="..\unittests\rehlds_tests_shared.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug Play|Win32'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release Play|Win32'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="..\unittests\clientview_tests.cpp">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug Play|Win32'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
@@ -357,6 +364,7 @@
     <ClInclude Include="..\engine\sv_steam3.h" />
     <ClInclude Include="..\engine\sv_upld.h" />
     <ClInclude Include="..\engine\sv_user.h" />
+    <ClInclude Include="..\engine\sv_clientview.h" />
     <ClInclude Include="..\engine\SystemWrapper.h" />
     <ClInclude Include="..\engine\sys_dll.h" />
     <ClInclude Include="..\engine\sys_dll2.h" />

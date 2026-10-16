@@ -118,6 +118,7 @@ set(PROJECT_PUBLIC_DIR
 set(ENGINE_SRCS
 	engine/sv_main.cpp
 	engine/sv_user.cpp
+	engine/sv_clientview.cpp
 	engine/sv_phys.cpp
 	engine/sv_move.cpp
 	engine/sv_pmove.cpp
@@ -187,6 +188,7 @@ set(ENGINE_SRCS
 )
 
 set(UNITTESTS_SRCS
+	unittests/clientview_tests.cpp
 	unittests/common_tests.cpp
 	unittests/crc32c_tests.cpp
 	unittests/delta_tests.cpp

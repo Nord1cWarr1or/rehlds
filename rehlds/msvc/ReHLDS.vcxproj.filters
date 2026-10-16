@@ -125,6 +125,9 @@
     <ClCompile Include="..\engine\sv_user.cpp">
       <Filter>engine\server</Filter>
     </ClCompile>
+    <ClCompile Include="..\engine\sv_clientview.cpp">
+      <Filter>engine\server</Filter>
+    </ClCompile>
     <ClCompile Include="..\engine\pmove.cpp">
       <Filter>engine\common</Filter>
     </ClCompile>
@@ -316,6 +319,9 @@
     </ClCompile>
     <ClCompile Include="..\engine\sse_mathfun.cpp">
       <Filter>engine</Filter>
+    </ClCompile>
+    <ClCompile Include="..\unittests\clientview_tests.cpp">
+      <Filter>unittests</Filter>
     </ClCompile>
     <ClCompile Include="..\unittests\security_tests.cpp">
       <Filter>unittests</Filter>

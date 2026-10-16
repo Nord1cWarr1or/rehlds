@@ -3923,6 +3923,8 @@ bool EXT_FUNC NET_GetPacketPreprocessor(uint8* data, unsigned int len, const net
 
 void SV_ReadPackets(void)
 {
+	SV_ClientViewReadPackets();
+
 	while (NET_GetPacket(NS_SERVER))
 	{
 #ifndef REHLDS_FIXES
@@ -5052,6 +5054,9 @@ void SV_WriteEntitiesToClient(client_t *client, sizebuf_t *msg)
 #endif
 		}
 	}
+
+	SV_UnlagTraceSnapshot(client, frame);
+	SV_ClientViewSnapshot(client, frame);
 
 	SV_EmitPacketEntities(client, pack, msg);
 	SV_EmitEvents(client, pack, msg);
@@ -8491,6 +8496,9 @@ void SV_Init(void)
 	Cvar_RegisterVariable(&sv_unlagpush);
 	Cvar_RegisterVariable(&sv_unlagsamples);
 	Cvar_RegisterVariable(&sv_unlaghull);
+	Cvar_RegisterVariable(&sv_unlag_trace);
+	Cvar_RegisterVariable(&sv_unlag_cmdage);
+	SV_ClientViewRegister();
 	Cvar_RegisterVariable(&sv_filterban);
 	Cvar_RegisterVariable(&sv_maxupdaterate);
 	Cvar_RegisterVariable(&sv_minupdaterate);
