@@ -37,9 +37,10 @@ cvar_t sv_rehlds_movecmdtime_max_warnings = { "sv_rehlds_movecmdtime_max_warning
 cvar_t sv_rehlds_movecmdtime_debug = { "sv_rehlds_movecmdtime_debug", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_gap_reset = { "sv_rehlds_movecmdtime_gap_reset", "0.5", 0, 0.5f, NULL };
 cvar_t sv_rehlds_movecmdtime_rate_min_window = { "sv_rehlds_movecmdtime_rate_min_window", "15", 0, 15.0f, NULL };
-cvar_t sv_rehlds_movecmdtime_stall_threshold = { "sv_rehlds_movecmdtime_stall_threshold", "0.25", 0, 0.25f, NULL };
+cvar_t sv_rehlds_movecmdtime_stall_threshold = { "sv_rehlds_movecmdtime_stall_threshold", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_stall_grace = { "sv_rehlds_movecmdtime_stall_grace", "3.0", 0, 3.0f, NULL };
-cvar_t sv_rehlds_movecmd_budget_max = { "sv_rehlds_movecmd_budget_max", "250", 0, 250.0f, NULL };
+cvar_t sv_rehlds_movecmd_budget_max = { "sv_rehlds_movecmd_budget_max", "0", 0, 0.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_airstuck_max_warnings = { "sv_rehlds_movecmdtime_airstuck_max_warnings", "-1", 0, -1.0f, NULL };
 
 CMoveCommandRateLimiter g_MoveCommandRateLimiter;
 CStringCommandsRateLimiter g_StringCommandsRateLimiter;
@@ -81,6 +82,26 @@ static void MCmd_Log(const char *fmt, ...)
 	}
 }
 CDlFileRateLimiter g_DlFileRateLimiter;
+
+// movecmdtime punishment, sv_rehlds_movecmdtime_punish: <0 - kick, 0 - permanent
+// ban, >0 - ban for that many minutes
+static void MCmd_Punish(client_t *cl, const char *reason, const char *metric, double value)
+{
+	if (sv_rehlds_movecmdtime_punish.value < 0.0f) {
+		Con_Printf("%s Kicked for %s (%s %.2f)\n", cl->name, reason, metric, value);
+		SV_DropClient(cl, FALSE, va("Kicked for %s", reason));
+		return;
+	}
+
+	if (sv_rehlds_movecmdtime_punish.value == 0.0f) {
+		Con_Printf("%s Permanently banned for %s (%s %.2f)\n", cl->name, reason, metric, value);
+	} else {
+		Con_Printf("%s Banned for %s (%s %.2f)\n", cl->name, reason, metric, value);
+	}
+
+	Cbuf_AddText(va("addip %.1f %s\n", sv_rehlds_movecmdtime_punish.value, NET_BaseAdrToString(cl->netchan.remote_address)));
+	SV_DropClient(cl, FALSE, va("Banned for %s", reason));
+}
 
 CMoveCommandRateLimiter::CMoveCommandRateLimiter() {
 	Q_memset(m_AverageMoveCmdRate, 0, sizeof(m_AverageMoveCmdRate));
@@ -410,6 +431,11 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		} else {
 			TrackNullSpan(clientId, ust, ucmd->msec, now);
 		}
+
+		// a client punished for air-stuck is gone, its command must not run
+		if (!cl->connected) {
+			return true;
+		}
 	}
 
 	// check move command flood within a single server tick
@@ -730,19 +756,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 			{
 				const char *punishReason = (abuseType == ABUSE_SPEEDHACK) ? "speedhack" : "slowmo";
 
-				if (sv_rehlds_movecmdtime_punish.value < 0.0f) {
-					Con_Printf("%s Kicked for %s (speed %.2f)\n", cl->name, punishReason, rate);
-					SV_DropClient(cl, FALSE, va("Kicked for %s", punishReason));
-				} else {
-					if (sv_rehlds_movecmdtime_punish.value == 0.0f) {
-						Con_Printf("%s Permanently banned for %s (speed %.2f)\n", cl->name, punishReason, rate);
-					} else {
-						Con_Printf("%s Banned for %s (speed %.2f)\n", cl->name, punishReason, rate);
-					}
-
-					Cbuf_AddText(va("addip %.1f %s\n", sv_rehlds_movecmdtime_punish.value, NET_BaseAdrToString(cl->netchan.remote_address)));
-					SV_DropClient(cl, FALSE, va("Banned for %s", punishReason));
-				}
+				MCmd_Punish(cl, punishReason, "speed", rate);
 
 				if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
 					MCmd_Log("PUNISH name=%s type=%s warnCount=%u telemWarn=%u rate=%.2f winSec=%.1f",
@@ -820,9 +834,24 @@ void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *
 				{
 					ust->stuckFlagged = true;
 					ust->airstuckCount++;
+					client_t *cl = &g_psvs.clients[clientId];
 					if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
 						MCmd_Log("WARN name=%s type=airstuck total=%u stuck=%.1fs nullDrops=%u (commands keep coming with no game time)",
-							g_psvs.clients[clientId].name, ust->airstuckCount, ust->stuckMs / 1000.0, ust->nullDrops);
+							cl->name, ust->airstuckCount, ust->stuckMs / 1000.0, ust->nullDrops);
+					}
+
+					// an air-stuck span is a cheat on its own: honest clients
+					// carry the fraction of a millisecond over and never send
+					// a second of zero-time commands
+					if (sv_rehlds_movecmdtime_airstuck_max_warnings.value >= 0.0f
+						&& ust->airstuckCount > (unsigned int)sv_rehlds_movecmdtime_airstuck_max_warnings.value)
+					{
+						if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+							MCmd_Log("PUNISH name=%s type=airstuck total=%u stuck=%.1fs",
+								cl->name, ust->airstuckCount, ust->stuckMs / 1000.0);
+						}
+						MCmd_Punish(cl, "airstuck", "stuck", ust->stuckMs / 1000.0);
+						return;
 					}
 				}
 			}
@@ -1134,6 +1163,7 @@ void Rehlds_Security_Init() {
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_stall_threshold);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_stall_grace);
 	Cvar_RegisterVariable(&sv_rehlds_movecmd_budget_max);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_airstuck_max_warnings);
 #endif
 }
 

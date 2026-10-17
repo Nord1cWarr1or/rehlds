@@ -60,6 +60,8 @@ TEST(IsSafeFileExtension, SecurityChecks, 1000)
 
 }
 
+#ifdef REHLDS_FIXES
+
 // movecmdtime detector simulation: one client plays against
 // CUserCmdTimeLimiter. The client runs frames at a fixed fps and reports
 // msec scaled by its game speed, sends a packet every few frames (new
@@ -119,6 +121,9 @@ struct movesim_params_t
 	// sv_rehlds_movecmdtime_min_scale for the run, 0 - keep the default
 	float minScale;
 
+	// sv_rehlds_movecmd_budget_max for the run
+	float budgetMax;
+
 	// air-stuck cheat: the client keeps sending commands with no time in
 	// them; with stuckTickEvery > 0 every that many-th command carries 1ms
 	// (dodges a plain zero-streak limit)
@@ -145,6 +150,7 @@ struct movesim_packet_t
 
 extern cvar_t sv_rehlds_movecmd_max_null_streak;
 extern cvar_t sv_rehlds_movecmdtime_min_scale;
+extern cvar_t sv_rehlds_movecmd_budget_max;
 
 static client_t s_simClients[MAX_CLIENTS];
 static edict_t s_simPlayer;
@@ -157,6 +163,7 @@ static void MoveSim_Defaults(movesim_params_t *p)
 	p->fps = 100;
 	p->cmdsPerPacket = 3;
 	p->numBackup = 2;
+	p->budgetMax = 250.0f;
 	p->speed = 1.0;
 	p->releasePerMs = 10;
 	p->silenceAt = -1.0;
@@ -231,6 +238,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	qboolean savedPaused = g_psv.paused;
 	float savedNullStreak = sv_rehlds_movecmd_max_null_streak.value;
 	float savedMinScale = sv_rehlds_movecmdtime_min_scale.value;
+	float savedBudgetMax = sv_rehlds_movecmd_budget_max.value;
 
 	Q_memset(res, 0, sizeof(*res));
 	Q_memset(s_simClients, 0, sizeof(s_simClients));
@@ -243,6 +251,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	sv_player = &s_simPlayer;
 	g_psv.paused = FALSE;
 	sv_rehlds_movecmd_max_null_streak.value = (float)p->nullStreak;
+	sv_rehlds_movecmd_budget_max.value = p->budgetMax;
 	if (p->minScale > 0.0f) {
 		sv_rehlds_movecmdtime_min_scale.value = p->minScale;
 	}
@@ -365,6 +374,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	g_psv.paused = savedPaused;
 	sv_rehlds_movecmd_max_null_streak.value = savedNullStreak;
 	sv_rehlds_movecmdtime_min_scale.value = savedMinScale;
+	sv_rehlds_movecmd_budget_max.value = savedBudgetMax;
 }
 
 static void MoveSim_Check(const char *what, bool cond, const movesim_result_t *res)
@@ -793,3 +803,5 @@ TEST(MoveCmdTimeFakedLoss, MoveCmdTime, 5000)
 	MoveSim_Check("faked loss is visible as excluded time", res.info.exclLossMs >= 50000, &res);
 	MoveSim_Check("faked loss leaves nothing to judge", res.info.detectSlow == 0, &res);
 }
+
+#endif // REHLDS_FIXES
