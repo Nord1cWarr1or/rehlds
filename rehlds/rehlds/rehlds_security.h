@@ -91,7 +91,7 @@ public:
 		unsigned int airstuckCount; // spans of commands that kept coming with no game time
 		uint64_t airstuckMs;       // real time of those spans
 		uint64_t exclGapMs;        // real time kept out of the window: client silence
-		uint64_t exclLossMs;       // real time kept out of the window: lost client commands
+		uint64_t lostEstMs;        // client time credited by estimate for lost client commands
 	};
 	void GetMeasureInfo(unsigned int clientId, measure_info_t *info) const;
 
@@ -109,12 +109,6 @@ private:
 		ABUSE_SPEEDHACK,
 		ABUSE_SLOWMO,
 		ABUSE_MAX
-	};
-
-	// why the current excluded span started
-	enum ExclReason {
-		EXCL_GAP,   // client silence longer than gap_reset (or the first command)
-		EXCL_LOSS   // client commands lost beyond the packet backups
 	};
 
 	struct rate_point_t {
@@ -141,16 +135,14 @@ private:
 		int ratePointCount;
 		unsigned int rateRestarts; // window restarts after long silence
 		uint64_t pendingDroppedMsec; // time of max_ticks-dropped cmds, added to the window with the next accepted interval
+		uint64_t pendingLostMsec;  // estimated time of lost cmds, added to the window with the next accepted interval
 
-		// excluded intervals: an interval that cannot be measured (long
-		// silence, lost commands) is kept out of the window together with the
-		// rest of its frame and, for a silence, the client time that
+		// excluded intervals: a long silence is kept out of the window
+		// together with the rest of its frame and the client time that
 		// arrives late for it
 		uint64_t exclFrameMs;      // realtime ms of the frame the last excluded interval opened
-		ExclReason exclFrameReason;
 		uint64_t exclDebtMs;       // client time still expected for an excluded silence
 		uint64_t exclDebtSinceMs;  // realtime ms the silence debt was last added
-		bool lossPending;          // a packet arrived after unrecoverable command loss, its commands are not judged
 		bool cmdsZeroed;           // the engine zeroed the msec of the current packet's commands (FL_FROZEN, paused)
 
 		// air-stuck: a span of commands that keep coming with (almost) no
@@ -159,6 +151,7 @@ private:
 		uint64_t stuckChunkStartMs;
 		uint64_t stuckChunkMsec;   // client time reported in the current chunk
 		uint64_t stuckMs;          // real time of the span's chunks that had no client time
+		uint64_t stuckNextWarnMs;  // stuckMs at which the span accrues its next warning
 		uint64_t stuckReplayMsec;  // time of the lost commands the engine replayed before the current packet
 		bool stuckLossGap;         // commands were lost before the current packet and none were replayed
 		uint64_t stuckLastCmdMs;   // realtime ms of the last command seen by the span tracker
@@ -187,8 +180,8 @@ private:
 		unsigned int replayedCmds;      // lost cmds replayed from lastcmd (bypass CheckLimits)
 		unsigned int lostCmds;          // lost cmds not run at all (net_drop >= 24)
 		uint64_t exclGapMs;             // real time excluded from the window: client silence
-		uint64_t exclLossMs;            // real time excluded from the window: lost commands
-		uint64_t dumpExclLossMs;        // exclLossMs at the previous state dump
+		uint64_t lostEstMs;             // client time credited by estimate for lost commands
+		uint64_t dumpLostEstMs;         // lostEstMs at the previous state dump
 		double lastDumpTime;
 		double nextDumpTime;
 		double lastWarnLogTime;

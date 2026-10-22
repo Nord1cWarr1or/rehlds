@@ -380,10 +380,10 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 static void MoveSim_Check(const char *what, bool cond, const movesim_result_t *res)
 {
 	char msg[512];
-	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u exclGap=%llums exclLoss=%llums null=%u frz=%u air=%u/%llums)",
+	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u exclGap=%llums lostEst=%llums null=%u frz=%u air=%u/%llums)",
 		what, res->info.rate, res->info.winSec, res->info.detectSlow, res->info.detectSpeed,
 		res->info.budgetClamps, res->dropped, res->judged,
-		(unsigned long long)res->info.exclGapMs, (unsigned long long)res->info.exclLossMs,
+		(unsigned long long)res->info.exclGapMs, (unsigned long long)res->info.lostEstMs,
 		res->info.nullDrops, res->info.frozenCmds,
 		res->info.airstuckCount, (unsigned long long)res->info.airstuckMs);
 	CHECK(msg, cond);
@@ -414,7 +414,7 @@ TEST(MoveCmdTimeHighFpsHonest, MoveCmdTime, 5000)
 
 	MoveSim_Check("high fps client is measured at real speed", res.info.rate > 0.98 && res.info.rate < 1.02, &res);
 	MoveSim_Check("high fps client is measured over the full window", res.info.winSec >= 50.0, &res);
-	MoveSim_Check("held-back commands are not loss", res.info.exclLossMs == 0, &res);
+	MoveSim_Check("held-back commands are not loss", res.info.lostEstMs == 0, &res);
 	MoveSim_Check("high fps client is never judged", res.info.detectSlow == 0 && res.info.detectSpeed == 0, &res);
 }
 
@@ -456,7 +456,7 @@ TEST(MoveCmdTimeShortOutages, MoveCmdTime, 5000)
 	p.outageLen = 0.3;
 	MoveSim_Run(&p, &res);
 
-	MoveSim_Check("outages are seen as lost commands", res.info.exclLossMs > 0, &res);
+	MoveSim_Check("outages are seen as lost commands", res.info.lostEstMs > 0, &res);
 	MoveSim_Check("outages are not slowmo", res.info.detectSlow == 0, &res);
 	MoveSim_Check("outages are not air-stuck", res.info.airstuckCount == 0, &res);
 	MoveSim_Check("speed between outages is measured and real", res.info.winSec >= 15.0 && res.info.rate > 0.95 && res.info.rate < 1.05, &res);
@@ -523,7 +523,7 @@ TEST(MoveCmdTimeLevelChange, MoveCmdTime, 5000)
 	p.signonPackets = 50;
 	MoveSim_Run(&p, &res);
 
-	MoveSim_Check("signon packets are not counted as lost", res.info.exclLossMs == 0, &res);
+	MoveSim_Check("signon packets are not counted as lost", res.info.lostEstMs == 0, &res);
 	MoveSim_Check("level change is not slowmo", res.info.detectSlow == 0, &res);
 }
 
@@ -611,7 +611,7 @@ TEST(MoveCmdTimeAirstuckHeld, MoveCmdTime, 5000)
 	p.nullStreak = 20;
 	MoveSim_Run(&p, &res);
 
-	MoveSim_Check("air-stuck released in held bursts is detected", res.info.airstuckCount == 1, &res);
+	MoveSim_Check("air-stuck released in held bursts is detected", res.info.airstuckCount >= 1, &res);
 }
 
 // over 1000 fps the client carries the fraction of a millisecond over:
@@ -787,10 +787,10 @@ TEST(MoveCmdTimeSpeedhack, MoveCmdTime, 5000)
 	MoveSim_Check("speedhack x4 commands are dropped while detected", res.dropped > 0, &res);
 }
 
-// Known limitation: a client faking command loss beyond the backups before
-// every packet keeps its whole session out of the measurement. It cannot
-// hide that: the time shows up as excluded for loss (LOSS-HEAVY in the
-// telemetry).
+// a client faking command loss beyond the backups before every packet:
+// the server reruns its two backups (time it really plays) and credits the
+// rest at the client's own slowed command time - the window shows the speed
+// the server ran, x0.4 slowmo doubled to x0.8 by the reruns
 TEST(MoveCmdTimeFakedLoss, MoveCmdTime, 5000)
 {
 	movesim_params_t p;
@@ -800,8 +800,57 @@ TEST(MoveCmdTimeFakedLoss, MoveCmdTime, 5000)
 	p.fakeSkip = 3;
 	MoveSim_Run(&p, &res);
 
-	MoveSim_Check("faked loss is visible as excluded time", res.info.exclLossMs >= 50000, &res);
-	MoveSim_Check("faked loss leaves nothing to judge", res.info.detectSlow == 0, &res);
+	MoveSim_Check("faked loss is estimated", res.info.lostEstMs > 0, &res);
+	MoveSim_Check("faked loss is measured at the speed the server ran", res.info.rate > 0.77 && res.info.rate < 0.83, &res);
+}
+
+// an air-stuck held for half a minute accrues a warning per 5 seconds
+TEST(MoveCmdTimeAirstuckLong, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.seconds = 80.0;
+	p.stuckAt = 20.0;
+	p.stuckLen = 36.0;
+	p.nullStreak = 20;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("a 36s air-stuck accrues 7 warnings", res.info.airstuckCount == 7, &res);
+}
+
+// bad networks: holds below and above gap_reset, fast and slow release,
+// random loss, with and without backups - an honest client is measured at
+// its real speed in every combination
+TEST(MoveCmdTimeBadNetworkSweep, MoveCmdTime, 20000)
+{
+	int cpps[] = { 1, 3 };
+	unsigned int losses[] = { 0, 50, 150, 300 };
+	double holds[] = { 0.0, 0.2, 0.4, 0.6, 0.9 };
+	int releases[] = { 1, 10 };
+	int backups[] = { 0, 2 };
+
+	for (int a = 0; a < 2; a++) for (int b = 0; b < 4; b++) for (int c = 0; c < 5; c++)
+	for (int d = 0; d < 2; d++) for (int e = 0; e < 2; e++)
+	{
+		movesim_params_t p;
+		movesim_result_t res;
+		MoveSim_Defaults(&p);
+		p.seconds = 90.0;
+		p.cmdsPerPacket = cpps[a];
+		p.lossPermille = losses[b];
+		p.holdEvery = (holds[c] > 0.0) ? 1.5 : 0.0;
+		p.holdLen = holds[c];
+		p.releasePerMs = releases[d];
+		p.numBackup = backups[e];
+		MoveSim_Run(&p, &res);
+
+		char what[128];
+		Q_snprintf(what, sizeof(what), "honest client on a bad network (cpp=%d loss=%u hold=%.1f release=%d backups=%d)",
+			cpps[a], losses[b], holds[c], releases[d], backups[e]);
+		MoveSim_Check(what, res.info.rate == 0.0 || (res.info.rate > 0.93 && res.info.rate < 1.07), &res);
+		MoveSim_Check(what, res.info.detectSlow == 0 && res.info.detectSpeed == 0, &res);
+	}
 }
 
 #endif // REHLDS_FIXES

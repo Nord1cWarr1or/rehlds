@@ -353,9 +353,10 @@ void CUserCmdTimeLimiter::ClientConnected(unsigned int clientId)
 #define RATE_STABLE_DECAY_MS 60000   // in-range speed time that forgives one warning
 #define BUDGET_REFILL_TOLERANCE 1.02 // budget refill speed relative to real time (client clock drift)
 #define RATE_EXCL_DEBT_AGE_MS 1000   // late client time for an excluded span is awaited this long at most
-#define LOSS_HEAVY_SHARE      0.8    // telemetry: share of a dump period excluded for packet loss that is logged
+#define LOSS_HEAVY_SHARE      0.8    // telemetry: share of a dump period's client time estimated for lost commands that is logged
 #define CLIENT_FRAME_CAP_MSEC 250    // the client caps a frame at 250ms (Host_FilterTime), a longer one reports only that
 #define AIRSTUCK_MIN_MS       1000   // commands with no client time in them for this long are an air-stuck
+#define AIRSTUCK_WARN_STEP_MS 5000   // a longer air-stuck accrues one more warning per this much of it
 #define AIRSTUCK_CHUNK_MS     250    // the air-stuck span is judged in chunks of this much real time
 #define AIRSTUCK_BREAK_MS     2000   // a command silence this long ends the span: no commands, no evidence
 
@@ -535,18 +536,16 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	}
 
 	// Wall time between accepted commands counts towards the speed window
-	// only when the client time for it is known to have arrived. Two cases
-	// break that and start an excluded span:
-	// - a silence longer than sv_rehlds_movecmdtime_gap_reset: the client
-	//   was not playing (AFK, minimized, loading) or held its commands back
-	// - client commands lost beyond the packet backups: they are replayed
-	//   from lastcmd or not run at all, so their time never reaches this check
+	// together with the client time that covers it. A silence longer than
+	// sv_rehlds_movecmdtime_gap_reset (AFK, minimized, loading, commands
+	// held back) starts an excluded span instead. Commands lost on the way
+	// do not: their time is credited by estimate (see OnMoveParsed), so a
+	// loss inside a held burst cannot leave the burst's wall time without
+	// its client time.
 	uint64_t gapMs = (ust->lastUpdateTime != 0 && now > ust->lastUpdateTime) ? (now - ust->lastUpdateTime) : 0;
 	bool firstCmd = (ust->lastUpdateTime == 0);
 	bool gapTooLong = (sv_rehlds_movecmdtime_gap_reset.value <= 0.0f
 		|| gapMs > (uint64_t)(sv_rehlds_movecmdtime_gap_reset.value * 1000.0f));
-	bool afterLoss = ust->lossPending;
-	ust->lossPending = false;
 
 	// A long command silence makes the stored window stale: restart it.
 	// The client's own silence decides, not how long the window took to
@@ -567,7 +566,6 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	}
 
 	bool intervalValid;
-	ExclReason reason;
 	if (firstCmd || gapTooLong)
 	{
 		// A held client delivers the time of a silence late, as a command
@@ -578,28 +576,15 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		// RATE_EXCL_DEBT_AGE_MS has passed (an AFK client that comes back
 		// has no backlog to deliver).
 		intervalValid = false;
-		reason = EXCL_GAP;
 		ust->exclDebtMs += gapMs;
 		ust->exclDebtSinceMs = now;
 		ust->exclFrameMs = now;
-		ust->exclFrameReason = reason;
-	}
-	else if (afterLoss)
-	{
-		// The time of lost commands never arrives - nothing to wait for. The
-		// packet that came after them is excluded as a whole (its backups
-		// cover only part of the loss), the stream after it is measured.
-		intervalValid = false;
-		reason = EXCL_LOSS;
-		ust->exclFrameMs = now;
-		ust->exclFrameReason = reason;
 	}
 	else if (now == ust->exclFrameMs)
 	{
 		// the rest of the frame (the packet, a burst) belongs to the excluded
 		// interval that opened it, even with no client time to wait for
 		intervalValid = false;
-		reason = ust->exclFrameReason;
 	}
 	else if (ucmd->msec >= CLIENT_FRAME_CAP_MSEC && gapMs > ucmd->msec)
 	{
@@ -608,12 +593,19 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		// not slowmo. The rest of the server frame is not excluded with it,
 		// so capped commands packed together (a speedhack) stay measured.
 		intervalValid = false;
-		reason = EXCL_GAP;
+	}
+	else if (debtOpen)
+	{
+		// While the backlog of a silence is still arriving, new commands
+		// queue up behind it: the wall time of these intervals is waited
+		// for too, or their client time would count with no wall time
+		// against it once the debt is paid.
+		intervalValid = false;
+		ust->exclDebtMs += gapMs;
 	}
 	else
 	{
-		intervalValid = !debtOpen;
-		reason = EXCL_GAP;
+		intervalValid = true;
 	}
 
 	if (firstCmd) {
@@ -623,23 +615,22 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	ust->totalMsec += ucmd->msec;
 
+	// client time of the interval: this command, commands max_ticks
+	// dropped and lost commands credited by estimate
+	uint64_t delivered = ucmd->msec + ust->pendingDroppedMsec + ust->pendingLostMsec;
+	ust->lostEstMs += ust->pendingLostMsec;
+	ust->pendingDroppedMsec = 0;
+	ust->pendingLostMsec = 0;
+
 	if (intervalValid) {
 		ust->rateWallMs += gapMs;
-		ust->rateMsecMs += ucmd->msec + ust->pendingDroppedMsec;
-		ust->pendingDroppedMsec = 0;
+		ust->rateMsecMs += delivered;
 	}
 	else {
-		// the excluded command and the parked msec of commands dropped
-		// over the interval pay back the time a silence is waiting for
-		uint64_t delivered = ucmd->msec + ust->pendingDroppedMsec;
+		// the excluded interval's client time pays back the time a silence
+		// is waiting for
 		ust->exclDebtMs = (delivered >= ust->exclDebtMs) ? 0 : (ust->exclDebtMs - delivered);
-		ust->pendingDroppedMsec = 0;
-
-		if (reason == EXCL_LOSS) {
-			ust->exclLossMs += gapMs;
-		} else {
-			ust->exclGapMs += gapMs;
-		}
+		ust->exclGapMs += gapMs;
 	}
 
 	// Movement-time budget: the allowance refills with real wall time (up
@@ -739,7 +730,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 				(abuseType == ABUSE_SPEEDHACK) ? "speedhack" : "slowmo",
 				ust->telemWarn[(int)abuseType],
 				rate, winSec, ust->avgMsec,
-				(ust->avgMsec > 0.0) ? (1000.0 / ust->avgMsec) : 0.0,
+				(ust->avgMsec >= 0.1) ? (1000.0 / ust->avgMsec) : 0.0,
 				(unsigned int)cl->packet_loss,
 				ust->cwCount, ust->ticksDrops, ust->nullDrops, ust->interpDrops);
 		}
@@ -830,9 +821,13 @@ void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *
 				ust->stuckChunkStartMs = ust->stuckLastCmdMs;
 				ust->stuckChunkMsec = 0;
 
-				if (!ust->stuckFlagged && ust->stuckMs >= AIRSTUCK_MIN_MS)
+				// one warning at AIRSTUCK_MIN_MS and one more per further
+				// AIRSTUCK_WARN_STEP_MS: a long hang does not hide behind a
+				// tolerated episode count
+				if (ust->stuckMs >= ust->stuckNextWarnMs)
 				{
 					ust->stuckFlagged = true;
+					ust->stuckNextWarnMs += AIRSTUCK_WARN_STEP_MS;
 					ust->airstuckCount++;
 					client_t *cl = &g_psvs.clients[clientId];
 					if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
@@ -850,7 +845,9 @@ void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *
 							MCmd_Log("PUNISH name=%s type=airstuck total=%u stuck=%.1fs",
 								cl->name, ust->airstuckCount, ust->stuckMs / 1000.0);
 						}
-						MCmd_Punish(cl, "airstuck", "stuck", ust->stuckMs / 1000.0);
+						double stuckSec = ust->stuckMs / 1000.0;
+						EndNullSpan(clientId, ust); // logged while the name is still known
+						MCmd_Punish(cl, "airstuck", "stuck", stuckSec);
 						return;
 					}
 				}
@@ -883,6 +880,7 @@ void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *
 		ust->stuckChunkStartMs = now;
 		ust->stuckChunkMsec = 0;
 		ust->stuckMs = 0;
+		ust->stuckNextWarnMs = AIRSTUCK_MIN_MS;
 		ust->stuckFlagged = false;
 	}
 
@@ -967,25 +965,24 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 	uint64_t elapsedMs = (ust->joinTime != 0 && now > ust->joinTime) ? (now - ust->joinTime) : 0;
 	double clockRate = (elapsedMs > 0) ? ((double)ust->totalMsec / (double)elapsedMs) : 0.0;
 
-	// a client whose commands are lost most of the time cannot be measured:
-	// a real network episode passes in a minute or two, a client faking
-	// loss to hide a slowdown shows up here for its whole session
+	// a client whose commands are lost most of the time is measured mostly
+	// by estimate: a real network episode passes in a minute or two
 	double periodSec = (ust->lastDumpTime > 0.0) ? (realtime - ust->lastDumpTime) : 0.0;
-	uint64_t periodLossMs = ust->exclLossMs - ust->dumpExclLossMs;
+	uint64_t periodLossMs = ust->lostEstMs - ust->dumpLostEstMs;
 	if (periodSec >= 5.0 && periodLossMs >= periodSec * 1000.0 * LOSS_HEAVY_SHARE) {
-		MCmd_Log("LOSS-HEAVY name=%s excluded=%.1fs/%.1fs lost=(r:%u l:%u) (speed not measurable while commands are lost)",
+		MCmd_Log("LOSS-HEAVY name=%s estimated=%.1fs/%.1fs lost=(r:%u l:%u) (most client time of the period comes from lost commands)",
 			cl->name, periodLossMs / 1000.0, periodSec, ust->replayedCmds, ust->lostCmds);
 	}
 	ust->lastDumpTime = realtime;
-	ust->dumpExclLossMs = ust->exclLossMs;
+	ust->dumpLostEstMs = ust->lostEstMs;
 
 	// clockRate drifts permanently after speedhack sessions (reported msec
 	// cannot be unreported) - rate above is the live metric
-	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u) excl=(g:%.0fs l:%.0fs) air=(n:%u t:%.0fs) frz=%u msec=%llums age=%.0fs",
+	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u est:%.0fs) excl=(g:%.0fs) air=(n:%u t:%.0fs) frz=%u msec=%llums age=%.0fs",
 		cl->name,
 		info.rate, info.winSec, clockRate,
 		ust->avgMsec,
-		(ust->avgMsec > 0.0) ? (1000.0 / ust->avgMsec) : 0.0,
+		(ust->avgMsec >= 0.1) ? (1000.0 / ust->avgMsec) : 0.0,
 		(unsigned int)cl->packet_loss,
 		ust->telemWarn[ABUSE_SPEEDHACK], ust->telemWarn[ABUSE_SLOWMO],
 		ust->ticksDrops, ust->nullDrops, ust->interpDrops,
@@ -994,8 +991,8 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		ust->stallImmuneSkipped,
 		ust->cwCount, ust->cwSkippedTotal,
 		ust->rateRestarts,
-		ust->replayedCmds, ust->lostCmds,
-		ust->exclGapMs / 1000.0, ust->exclLossMs / 1000.0,
+		ust->replayedCmds, ust->lostCmds, ust->lostEstMs / 1000.0,
+		ust->exclGapMs / 1000.0,
 		ust->airstuckCount, ust->airstuckMs / 1000.0,
 		ust->frozenCmds,
 		(unsigned long long)ust->totalMsec,
@@ -1034,7 +1031,7 @@ void CUserCmdTimeLimiter::GetMeasureInfo(unsigned int clientId, measure_info_t *
 	info->airstuckCount = ust->airstuckCount;
 	info->airstuckMs = ust->airstuckMs;
 	info->exclGapMs = ust->exclGapMs;
-	info->exclLossMs = ust->exclLossMs;
+	info->lostEstMs = ust->lostEstMs;
 }
 
 void CUserCmdTimeLimiter::OnClockWindowSet(unsigned int clientId, double dif)
@@ -1074,15 +1071,18 @@ void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int n
 	// and SV_ParseMove takes the new commands of the packet off the
 	// sequence gap. Up to numBackup lost cmds are recovered from the packet
 	// backup and pass CheckLimits with their time. The rest are replayed
-	// from lastcmd, or with netDrop >= 24 not run at all - their time never
-	// reaches the speed window.
+	// from lastcmd, or with netDrop >= 24 not run at all - they never reach
+	// CheckLimits. Their count is exact, their time is credited by
+	// estimate: the time of the replayed lastcmd, or the client's average
+	// command time when nothing is run. A slowed or sped-up client is
+	// estimated at its own speed, so faking loss hides nothing.
 	if (netDrop <= numBackup) {
 		return;
 	}
 
-	ust->lossPending = true;
-
 	unsigned int missing = (unsigned int)(netDrop - numBackup);
+	double estMsec = (netDrop < 24) ? (double)lastMsec : ust->avgMsec;
+	ust->pendingLostMsec += (uint64_t)(missing * estMsec + 0.5);
 
 	// air-stuck span: the replayed commands carry the time of lastcmd (none
 	// for a stuck client, faked loss included); with nothing run the time of
