@@ -196,6 +196,7 @@ private:
 	void TrackNullSpan(unsigned int clientId, usercmd_state_t *ust, unsigned int msec, uint64_t now);
 	void EndNullSpan(unsigned int clientId, usercmd_state_t *ust);
 	static bool WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec);
+	static double RecentRate(const usercmd_state_t *ust);
 };
 
 extern CUserCmdTimeLimiter g_UserCmdTimeLimiter;

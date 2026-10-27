@@ -32,8 +32,11 @@ cvar_t sv_rehlds_movecmd_clamp_interp = { "sv_rehlds_movecmd_clamp_interp", "1",
 cvar_t sv_rehlds_movecmdtime_enabled = { "sv_rehlds_movecmdtime_enabled", "1", 0, 1.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_max_scale = { "sv_rehlds_movecmdtime_max_scale", "3.0", 0, 3.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_min_scale = { "sv_rehlds_movecmdtime_min_scale", "0.5", 0, 0.5f, NULL };
-cvar_t sv_rehlds_movecmdtime_punish = { "sv_rehlds_movecmdtime_punish", "-1", 0, -1.0f, NULL };
-cvar_t sv_rehlds_movecmdtime_max_warnings = { "sv_rehlds_movecmdtime_max_warnings", "-1", 0, -1.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_speedhack_max_warnings = { "sv_rehlds_movecmdtime_speedhack_max_warnings", "-1", 0, -1.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_speedhack_punish = { "sv_rehlds_movecmdtime_speedhack_punish", "-1", 0, -1.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_speedhack_drop = { "sv_rehlds_movecmdtime_speedhack_drop", "0", 0, 0.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_slowmo_max_warnings = { "sv_rehlds_movecmdtime_slowmo_max_warnings", "-1", 0, -1.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_slowmo_punish = { "sv_rehlds_movecmdtime_slowmo_punish", "-1", 0, -1.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_debug = { "sv_rehlds_movecmdtime_debug", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_gap_reset = { "sv_rehlds_movecmdtime_gap_reset", "0.5", 0, 0.5f, NULL };
 cvar_t sv_rehlds_movecmdtime_rate_min_window = { "sv_rehlds_movecmdtime_rate_min_window", "15", 0, 15.0f, NULL };
@@ -41,6 +44,7 @@ cvar_t sv_rehlds_movecmdtime_stall_threshold = { "sv_rehlds_movecmdtime_stall_th
 cvar_t sv_rehlds_movecmdtime_stall_grace = { "sv_rehlds_movecmdtime_stall_grace", "3.0", 0, 3.0f, NULL };
 cvar_t sv_rehlds_movecmd_budget_max = { "sv_rehlds_movecmd_budget_max", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_airstuck_max_warnings = { "sv_rehlds_movecmdtime_airstuck_max_warnings", "-1", 0, -1.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_airstuck_punish = { "sv_rehlds_movecmdtime_airstuck_punish", "-1", 0, -1.0f, NULL };
 
 CMoveCommandRateLimiter g_MoveCommandRateLimiter;
 CStringCommandsRateLimiter g_StringCommandsRateLimiter;
@@ -83,23 +87,23 @@ static void MCmd_Log(const char *fmt, ...)
 }
 CDlFileRateLimiter g_DlFileRateLimiter;
 
-// movecmdtime punishment, sv_rehlds_movecmdtime_punish: <0 - kick, 0 - permanent
-// ban, >0 - ban for that many minutes
-static void MCmd_Punish(client_t *cl, const char *reason, const char *metric, double value)
+// movecmdtime punishment, punish (the cheat's *_punish cvar): <0 - kick,
+// 0 - permanent ban, >0 - ban for that many minutes
+static void MCmd_Punish(client_t *cl, const char *reason, const char *metric, double value, float punish)
 {
-	if (sv_rehlds_movecmdtime_punish.value < 0.0f) {
+	if (punish < 0.0f) {
 		Con_Printf("%s Kicked for %s (%s %.2f)\n", cl->name, reason, metric, value);
 		SV_DropClient(cl, FALSE, va("Kicked for %s", reason));
 		return;
 	}
 
-	if (sv_rehlds_movecmdtime_punish.value == 0.0f) {
+	if (punish == 0.0f) {
 		Con_Printf("%s Permanently banned for %s (%s %.2f)\n", cl->name, reason, metric, value);
 	} else {
 		Con_Printf("%s Banned for %s (%s %.2f)\n", cl->name, reason, metric, value);
 	}
 
-	Cbuf_AddText(va("addip %.1f %s\n", sv_rehlds_movecmdtime_punish.value, NET_BaseAdrToString(cl->netchan.remote_address)));
+	Cbuf_AddText(va("addip %.1f %s\n", punish, NET_BaseAdrToString(cl->netchan.remote_address)));
 	SV_DropClient(cl, FALSE, va("Banned for %s", reason));
 }
 
@@ -347,6 +351,7 @@ void CUserCmdTimeLimiter::ClientConnected(unsigned int clientId)
 
 // detector internals (policy knobs are cvars, these are not)
 #define RATE_POINT_STEP_MS   2500.0  // sample a control point each 2.5s of wall progress
+#define RATE_RECENT_MS       2500    // the recent speed (speedhack_drop 1) spans at least this much wall time
 #define RATE_PAUSE_RESET_MS  10000   // window restarts after this much command silence
 #define MIN_RATE_MSEC_MS     3000    // need this much reported client time to judge speed
 #define RATE_WARN_ACCRUE_MS  10000   // one warning accrual per this ms inside an episode
@@ -765,18 +770,23 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 			ust->lastDetectMs = now;
 			ust->warnings[(int)abuseType]++;
 
-			if (sv_rehlds_movecmdtime_max_warnings.value >= 0.0f
-				&& ust->warnings[(int)abuseType] > (unsigned int)sv_rehlds_movecmdtime_max_warnings.value)
+			const cvar_t *maxWarnings = (abuseType == ABUSE_SPEEDHACK)
+				? &sv_rehlds_movecmdtime_speedhack_max_warnings : &sv_rehlds_movecmdtime_slowmo_max_warnings;
+			const cvar_t *punish = (abuseType == ABUSE_SPEEDHACK)
+				? &sv_rehlds_movecmdtime_speedhack_punish : &sv_rehlds_movecmdtime_slowmo_punish;
+
+			if (maxWarnings->value >= 0.0f
+				&& ust->warnings[(int)abuseType] > (unsigned int)maxWarnings->value)
 			{
 				const char *punishReason = (abuseType == ABUSE_SPEEDHACK) ? "speedhack" : "slowmo";
-
-				MCmd_Punish(cl, punishReason, "speed", rate);
 
 				if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
 					MCmd_Log("PUNISH name=%s type=%s warnCount=%u telemWarn=%u rate=%.2f winSec=%.1f",
 						cl->name, punishReason, ust->warnings[(int)abuseType], ust->telemWarn[(int)abuseType],
 						rate, winSec);
 				}
+
+				MCmd_Punish(cl, punishReason, "speed", rate, punish->value);
 			}
 		}
 
@@ -787,14 +797,21 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 			return true;
 		}
 
-		// A measured speedhack loses its commands while the episode lasts:
-		// the client keeps gaining speed it did not play through. A measured
-		// slowdown is only judged, its commands still run - a slow client
-		// gains nothing from them, and an innocent one (bad network the
-		// window could not see) would be frozen in place.
-		if (abuseType == ABUSE_SPEEDHACK) {
-			ust->abuseDrops[ABUSE_SPEEDHACK]++;
-			return true;
+		// sv_rehlds_movecmdtime_speedhack_drop: a measured speedhack loses
+		// its commands - 2 while the window speed stays above max_scale
+		// (the window spans a minute, the client stays frozen long after the
+		// cheat is off), 1 only while its recent speed is above it too, 0
+		// never (the movement budget alone takes the extra time away). A
+		// measured slowdown is only judged, its commands still run - a slow
+		// client gains nothing from them, and an innocent one would be
+		// frozen in place.
+		if (abuseType == ABUSE_SPEEDHACK)
+		{
+			int dropMode = (int)sv_rehlds_movecmdtime_speedhack_drop.value;
+			if (dropMode >= 2 || (dropMode == 1 && RecentRate(ust) > sv_rehlds_movecmdtime_max_scale.value)) {
+				ust->abuseDrops[ABUSE_SPEEDHACK]++;
+				return true;
+			}
 		}
 
 		return nullDrop;
@@ -870,7 +887,7 @@ void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *
 						}
 						double stuckSec = ust->stuckMs / 1000.0;
 						EndNullSpan(clientId, ust); // logged while the name is still known
-						MCmd_Punish(cl, "airstuck", "stuck", stuckSec);
+						MCmd_Punish(cl, "airstuck", "stuck", stuckSec, sv_rehlds_movecmdtime_airstuck_punish.value);
 						return;
 					}
 				}
@@ -1020,6 +1037,26 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		ust->frozenCmds,
 		(unsigned long long)ust->totalMsec,
 		elapsedMs / 1000.0);
+}
+
+// client speed over the last RATE_RECENT_MS..2*RATE_RECENT_MS of measured
+// wall time; the whole window when it is not that long yet
+double CUserCmdTimeLimiter::RecentRate(const usercmd_state_t *ust)
+{
+	for (int i = ust->ratePointCount - 1; i >= 0; i--)
+	{
+		const rate_point_t *p = &ust->ratePoints[i];
+		uint64_t dWall = ust->rateWallMs - p->wallMs;
+		if (dWall >= RATE_RECENT_MS) {
+			return (double)(ust->rateMsecMs - p->msecMs) / (double)dWall;
+		}
+	}
+
+	uint64_t dWall, dMsec;
+	if (WindowTotals(ust, &dWall, &dMsec) && dWall > 0) {
+		return (double)dMsec / (double)dWall;
+	}
+	return 0.0;
 }
 
 bool CUserCmdTimeLimiter::WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec)
@@ -1178,8 +1215,11 @@ void Rehlds_Security_Init() {
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_enabled);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_max_scale);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_min_scale);
-	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_punish);
-	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_max_warnings);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_speedhack_max_warnings);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_speedhack_punish);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_speedhack_drop);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_slowmo_max_warnings);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_slowmo_punish);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_debug);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_gap_reset);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_rate_min_window);
@@ -1187,6 +1227,7 @@ void Rehlds_Security_Init() {
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_stall_grace);
 	Cvar_RegisterVariable(&sv_rehlds_movecmd_budget_max);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_airstuck_max_warnings);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_airstuck_punish);
 #endif
 }
 

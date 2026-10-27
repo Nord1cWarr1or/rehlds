@@ -125,6 +125,14 @@ struct movesim_params_t
 	// sv_rehlds_movecmd_budget_max for the run
 	float budgetMax;
 
+	// sv_rehlds_movecmdtime_speedhack_drop for the run
+	int speedhackDrop;
+
+	// with speedLen > 0 the client runs at speed only from speedAt for
+	// speedLen seconds, at real speed otherwise
+	double speedAt;
+	double speedLen;
+
 	// air-stuck cheat: the client keeps sending commands with no time in
 	// them; with stuckTickEvery > 0 every that many-th command carries 1ms
 	// (dodges a plain zero-streak limit)
@@ -139,6 +147,7 @@ struct movesim_result_t
 	CUserCmdTimeLimiter::measure_info_t info;
 	unsigned int judged;  // commands that reached CheckLimits
 	unsigned int dropped; // commands CheckLimits refused
+	unsigned int droppedAfter; // of them, more than 3s after the speed window ended
 };
 
 struct movesim_packet_t
@@ -152,6 +161,9 @@ struct movesim_packet_t
 extern cvar_t sv_rehlds_movecmd_max_null_streak;
 extern cvar_t sv_rehlds_movecmdtime_min_scale;
 extern cvar_t sv_rehlds_movecmd_budget_max;
+extern cvar_t sv_rehlds_movecmdtime_speedhack_drop;
+
+static double s_simDropAfterRealtime; // drops past this realtime count as droppedAfter
 
 static client_t s_simClients[MAX_CLIENTS];
 static edict_t s_simPlayer;
@@ -184,6 +196,9 @@ static void MoveSim_RunCmd(byte msec, movesim_result_t *res)
 	res->judged++;
 	if (g_UserCmdTimeLimiter.CheckLimits(0, &cmd)) {
 		res->dropped++;
+		if (realtime > s_simDropAfterRealtime) {
+			res->droppedAfter++;
+		}
 	}
 }
 
@@ -248,6 +263,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	float savedNullStreak = sv_rehlds_movecmd_max_null_streak.value;
 	float savedMinScale = sv_rehlds_movecmdtime_min_scale.value;
 	float savedBudgetMax = sv_rehlds_movecmd_budget_max.value;
+	float savedSpeedhackDrop = sv_rehlds_movecmdtime_speedhack_drop.value;
 
 	Q_memset(res, 0, sizeof(*res));
 	Q_memset(s_simClients, 0, sizeof(s_simClients));
@@ -261,6 +277,8 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	g_psv.paused = FALSE;
 	sv_rehlds_movecmd_max_null_streak.value = (float)p->nullStreak;
 	sv_rehlds_movecmd_budget_max.value = p->budgetMax;
+	sv_rehlds_movecmdtime_speedhack_drop.value = (float)p->speedhackDrop;
+	s_simDropAfterRealtime = (p->speedLen > 0.0) ? 1000.0 + p->speedAt + p->speedLen + 3.0 : 1.0e12;
 	if (p->minScale > 0.0f) {
 		sv_rehlds_movecmdtime_min_scale.value = p->minScale;
 	}
@@ -325,7 +343,8 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 			msec = (p->stuckTickEvery > 0 && stuckCmds % p->stuckTickEvery == 0) ? 1 : 0;
 		} else {
 			// Host_FilterTime caps a client frame at 250ms
-			msecCarry += ((frameSec < 0.25) ? frameSec : 0.25) * 1000.0 * p->speed;
+			double speed = (p->speedLen > 0.0 && (t < p->speedAt || t >= p->speedAt + p->speedLen)) ? 1.0 : p->speed;
+			msecCarry += ((frameSec < 0.25) ? frameSec : 0.25) * 1000.0 * speed;
 			msec = (int)msecCarry;
 			if (msec > 255) msec = 255;
 			msecCarry -= msec;
@@ -384,6 +403,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	sv_rehlds_movecmd_max_null_streak.value = savedNullStreak;
 	sv_rehlds_movecmdtime_min_scale.value = savedMinScale;
 	sv_rehlds_movecmd_budget_max.value = savedBudgetMax;
+	sv_rehlds_movecmdtime_speedhack_drop.value = savedSpeedhackDrop;
 }
 
 static void MoveSim_Check(const char *what, bool cond, const movesim_result_t *res)
@@ -793,7 +813,35 @@ TEST(MoveCmdTimeSpeedhack, MoveCmdTime, 5000)
 
 	MoveSim_Check("speedhack x4 is clipped by the budget", res.info.budgetClamps > 0, &res);
 	MoveSim_Check("speedhack x4 is detected", res.info.detectSpeed > 0, &res);
-	MoveSim_Check("speedhack x4 commands are dropped while detected", res.dropped > 0, &res);
+	MoveSim_Check("speedhack x4 commands are not dropped by default", res.dropped == 0, &res);
+}
+
+// speedhack x8 for 30s, then 40s at real speed: the window average stays
+// above max_scale (3.0) long after the cheat is off
+TEST(MoveCmdTimeSpeedhackDropModes, MoveCmdTime, 5000)
+{
+	for (int mode = 0; mode <= 2; mode++)
+	{
+		movesim_params_t p;
+		movesim_result_t res;
+		MoveSim_Defaults(&p);
+		p.seconds = 100.0;
+		p.speed = 8.0;
+		p.speedAt = 30.0;
+		p.speedLen = 30.0;
+		p.speedhackDrop = mode;
+		MoveSim_Run(&p, &res);
+
+		MoveSim_Check("speedhack is detected in every drop mode", res.info.detectSpeed > 0, &res);
+		if (mode == 0) {
+			MoveSim_Check("drop 0: no command is dropped", res.dropped == 0, &res);
+		} else if (mode == 1) {
+			MoveSim_Check("drop 1: commands are dropped while the speedhack is on", res.dropped > 0, &res);
+			MoveSim_Check("drop 1: the client moves again within 3s after it is off", res.droppedAfter == 0, &res);
+		} else {
+			MoveSim_Check("drop 2: the client stays frozen after the speedhack is off", res.droppedAfter > 0, &res);
+		}
+	}
 }
 
 // a client faking command loss beyond the backups before every packet:
