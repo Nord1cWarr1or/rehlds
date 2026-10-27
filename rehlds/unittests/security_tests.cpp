@@ -122,8 +122,14 @@ struct movesim_params_t
 	// sv_rehlds_movecmdtime_min_scale for the run, 0 - keep the default
 	float minScale;
 
-	// sv_rehlds_movecmd_budget_max for the run
+	// sv_rehlds_movecmdtime_budget_max and _speedhack_budget for the run
 	float budgetMax;
+	int speedhackBudget;
+
+	// sv_rehlds_movecmdtime_*_warnings for the run
+	int speedhackWarnings;
+	int slowmoWarnings;
+	int airstuckWarnings;
 
 	// sv_rehlds_movecmdtime_speedhack_drop for the run
 	int speedhackDrop;
@@ -160,7 +166,11 @@ struct movesim_packet_t
 
 extern cvar_t sv_rehlds_movecmd_max_null_streak;
 extern cvar_t sv_rehlds_movecmdtime_min_scale;
-extern cvar_t sv_rehlds_movecmd_budget_max;
+extern cvar_t sv_rehlds_movecmdtime_budget_max;
+extern cvar_t sv_rehlds_movecmdtime_speedhack_budget;
+extern cvar_t sv_rehlds_movecmdtime_speedhack_warnings;
+extern cvar_t sv_rehlds_movecmdtime_slowmo_warnings;
+extern cvar_t sv_rehlds_movecmdtime_airstuck_warnings;
 extern cvar_t sv_rehlds_movecmdtime_speedhack_drop;
 
 static double s_simDropAfterRealtime; // drops past this realtime count as droppedAfter
@@ -177,6 +187,7 @@ static void MoveSim_Defaults(movesim_params_t *p)
 	p->cmdsPerPacket = 3;
 	p->numBackup = 2;
 	p->budgetMax = 250.0f;
+	p->speedhackBudget = 1;
 	p->speed = 1.0;
 	p->releasePerMs = 10;
 	p->silenceAt = -1.0;
@@ -262,7 +273,11 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	qboolean savedPaused = g_psv.paused;
 	float savedNullStreak = sv_rehlds_movecmd_max_null_streak.value;
 	float savedMinScale = sv_rehlds_movecmdtime_min_scale.value;
-	float savedBudgetMax = sv_rehlds_movecmd_budget_max.value;
+	float savedBudgetMax = sv_rehlds_movecmdtime_budget_max.value;
+	float savedSpeedhackBudget = sv_rehlds_movecmdtime_speedhack_budget.value;
+	float savedSpeedhackWarnings = sv_rehlds_movecmdtime_speedhack_warnings.value;
+	float savedSlowmoWarnings = sv_rehlds_movecmdtime_slowmo_warnings.value;
+	float savedAirstuckWarnings = sv_rehlds_movecmdtime_airstuck_warnings.value;
 	float savedSpeedhackDrop = sv_rehlds_movecmdtime_speedhack_drop.value;
 
 	Q_memset(res, 0, sizeof(*res));
@@ -276,7 +291,11 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	sv_player = &s_simPlayer;
 	g_psv.paused = FALSE;
 	sv_rehlds_movecmd_max_null_streak.value = (float)p->nullStreak;
-	sv_rehlds_movecmd_budget_max.value = p->budgetMax;
+	sv_rehlds_movecmdtime_budget_max.value = p->budgetMax;
+	sv_rehlds_movecmdtime_speedhack_budget.value = (float)p->speedhackBudget;
+	sv_rehlds_movecmdtime_speedhack_warnings.value = (float)p->speedhackWarnings;
+	sv_rehlds_movecmdtime_slowmo_warnings.value = (float)p->slowmoWarnings;
+	sv_rehlds_movecmdtime_airstuck_warnings.value = (float)p->airstuckWarnings;
 	sv_rehlds_movecmdtime_speedhack_drop.value = (float)p->speedhackDrop;
 	s_simDropAfterRealtime = (p->speedLen > 0.0) ? 1000.0 + p->speedAt + p->speedLen + 3.0 : 1.0e12;
 	if (p->minScale > 0.0f) {
@@ -402,7 +421,11 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	g_psv.paused = savedPaused;
 	sv_rehlds_movecmd_max_null_streak.value = savedNullStreak;
 	sv_rehlds_movecmdtime_min_scale.value = savedMinScale;
-	sv_rehlds_movecmd_budget_max.value = savedBudgetMax;
+	sv_rehlds_movecmdtime_budget_max.value = savedBudgetMax;
+	sv_rehlds_movecmdtime_speedhack_budget.value = savedSpeedhackBudget;
+	sv_rehlds_movecmdtime_speedhack_warnings.value = savedSpeedhackWarnings;
+	sv_rehlds_movecmdtime_slowmo_warnings.value = savedSlowmoWarnings;
+	sv_rehlds_movecmdtime_airstuck_warnings.value = savedAirstuckWarnings;
 	sv_rehlds_movecmdtime_speedhack_drop.value = savedSpeedhackDrop;
 }
 
@@ -814,6 +837,19 @@ TEST(MoveCmdTimeSpeedhack, MoveCmdTime, 5000)
 	MoveSim_Check("speedhack x4 is clipped by the budget", res.info.budgetClamps > 0, &res);
 	MoveSim_Check("speedhack x4 is detected", res.info.detectSpeed > 0, &res);
 	MoveSim_Check("speedhack x4 commands are not dropped by default", res.dropped == 0, &res);
+}
+
+// warnings accrue only while the cheat's punishment is switched on
+TEST(MoveCmdTimeWarningsCount, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.speed = 4.0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("a speedhack is judged without its punishment switch", res.info.detectSpeed > 0, &res);
+	MoveSim_Check("no warning accrues without the punishment switch", res.info.warnSpeed == 0, &res);
 }
 
 // speedhack x8 for 30s, then 40s at real speed: the window average stays

@@ -86,6 +86,8 @@ public:
 		unsigned int detectSpeed;  // commands judged as speedhack
 		unsigned int detectSlow;   // commands judged as slowmo
 		unsigned int budgetClamps;
+		unsigned int warnSpeed;    // speedhack warnings accrued towards the punishment
+		unsigned int warnSlow;     // slowmo warnings accrued towards the punishment
 		unsigned int nullDrops;    // commands dropped by the null-command streak limit
 		unsigned int frozenCmds;   // commands the engine zeroed itself (FL_FROZEN, paused)
 		unsigned int airstuckCount; // spans of commands that kept coming with no game time
@@ -134,6 +136,10 @@ private:
 		rate_point_t ratePoints[RATE_POINTS_MAX];
 		int ratePointCount;
 		unsigned int rateRestarts; // window restarts after long silence
+		uint64_t recentWallMs;     // running totals at the latest recent-speed snapshot
+		uint64_t recentMsecMs;
+		uint64_t recentPrevWallMs; // and at the one before it
+		uint64_t recentPrevMsecMs;
 		uint64_t pendingDroppedMsec; // time of max_ticks-dropped cmds, added to the window with the next accepted interval
 		uint64_t pendingLostMsec;  // estimated time of lost cmds, added to the window with the next accepted interval
 

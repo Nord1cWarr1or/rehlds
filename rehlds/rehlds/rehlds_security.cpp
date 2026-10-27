@@ -26,24 +26,26 @@ const unsigned int MAX_DLFILE_EMPTY_STRIKES = 100;
 // client can always fetch every missing resource with one connect batch.
 const float DLFILE_BUCKET_MARGIN = 16.0f;
 
-cvar_t sv_rehlds_movecmd_max_ticks = { "sv_rehlds_movecmd_max_ticks", "24", 0, 24.0f, NULL };
+cvar_t sv_rehlds_movecmd_max_ticks = { "sv_rehlds_movecmd_max_ticks", "64", 0, 64.0f, NULL };
 cvar_t sv_rehlds_movecmd_max_null_streak = { "sv_rehlds_movecmd_max_null_streak", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmd_clamp_interp = { "sv_rehlds_movecmd_clamp_interp", "1", 0, 1.0f, NULL };
-cvar_t sv_rehlds_movecmdtime_enabled = { "sv_rehlds_movecmdtime_enabled", "1", 0, 1.0f, NULL };
-cvar_t sv_rehlds_movecmdtime_max_scale = { "sv_rehlds_movecmdtime_max_scale", "3.0", 0, 3.0f, NULL };
-cvar_t sv_rehlds_movecmdtime_min_scale = { "sv_rehlds_movecmdtime_min_scale", "0.5", 0, 0.5f, NULL };
-cvar_t sv_rehlds_movecmdtime_speedhack_max_warnings = { "sv_rehlds_movecmdtime_speedhack_max_warnings", "-1", 0, -1.0f, NULL };
+// movecmdtime: switches (the reaction to a cheat) are off by default,
+// settings carry the recommended values
+cvar_t sv_rehlds_movecmdtime_max_scale = { "sv_rehlds_movecmdtime_max_scale", "1.5", 0, 1.5f, NULL };
+cvar_t sv_rehlds_movecmdtime_min_scale = { "sv_rehlds_movecmdtime_min_scale", "0.65", 0, 0.65f, NULL };
+cvar_t sv_rehlds_movecmdtime_speedhack_budget = { "sv_rehlds_movecmdtime_speedhack_budget", "0", 0, 0.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_speedhack_warnings = { "sv_rehlds_movecmdtime_speedhack_warnings", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_speedhack_punish = { "sv_rehlds_movecmdtime_speedhack_punish", "-1", 0, -1.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_speedhack_drop = { "sv_rehlds_movecmdtime_speedhack_drop", "0", 0, 0.0f, NULL };
-cvar_t sv_rehlds_movecmdtime_slowmo_max_warnings = { "sv_rehlds_movecmdtime_slowmo_max_warnings", "-1", 0, -1.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_slowmo_warnings = { "sv_rehlds_movecmdtime_slowmo_warnings", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_slowmo_punish = { "sv_rehlds_movecmdtime_slowmo_punish", "-1", 0, -1.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_debug = { "sv_rehlds_movecmdtime_debug", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_gap_reset = { "sv_rehlds_movecmdtime_gap_reset", "0.5", 0, 0.5f, NULL };
 cvar_t sv_rehlds_movecmdtime_rate_min_window = { "sv_rehlds_movecmdtime_rate_min_window", "15", 0, 15.0f, NULL };
-cvar_t sv_rehlds_movecmdtime_stall_threshold = { "sv_rehlds_movecmdtime_stall_threshold", "0", 0, 0.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_stall_threshold = { "sv_rehlds_movecmdtime_stall_threshold", "0.25", 0, 0.25f, NULL };
 cvar_t sv_rehlds_movecmdtime_stall_grace = { "sv_rehlds_movecmdtime_stall_grace", "3.0", 0, 3.0f, NULL };
-cvar_t sv_rehlds_movecmd_budget_max = { "sv_rehlds_movecmd_budget_max", "0", 0, 0.0f, NULL };
-cvar_t sv_rehlds_movecmdtime_airstuck_max_warnings = { "sv_rehlds_movecmdtime_airstuck_max_warnings", "-1", 0, -1.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_budget_max = { "sv_rehlds_movecmdtime_budget_max", "300", 0, 300.0f, NULL };
+cvar_t sv_rehlds_movecmdtime_airstuck_warnings = { "sv_rehlds_movecmdtime_airstuck_warnings", "0", 0, 0.0f, NULL };
 cvar_t sv_rehlds_movecmdtime_airstuck_punish = { "sv_rehlds_movecmdtime_airstuck_punish", "-1", 0, -1.0f, NULL };
 
 CMoveCommandRateLimiter g_MoveCommandRateLimiter;
@@ -351,7 +353,7 @@ void CUserCmdTimeLimiter::ClientConnected(unsigned int clientId)
 
 // detector internals (policy knobs are cvars, these are not)
 #define RATE_POINT_STEP_MS   2500.0  // sample a control point each 2.5s of wall progress
-#define RATE_RECENT_MS       2500    // the recent speed (speedhack_drop 1) spans at least this much wall time
+#define RATE_RECENT_MS       1000    // the recent speed (speedhack_drop 1) spans this much to twice this much wall time
 #define RATE_PAUSE_RESET_MS  10000   // window restarts after this much command silence
 #define MIN_RATE_MSEC_MS     3000    // need this much reported client time to judge speed
 #define RATE_WARN_ACCRUE_MS  10000   // one warning accrual per this ms inside an episode
@@ -433,7 +435,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	}
 
 	// air-stuck sees every command the client sent, before any drop gate
-	if (sv_rehlds_movecmdtime_enabled.value > 0.0f) {
+	{
 		if (serverFrozen) {
 			EndNullSpan(clientId, ust);
 		} else {
@@ -522,11 +524,6 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// Time speed detection
 	//
 
-	// sv_rehlds_movecmdtime_enabled 0 disables the whole time-speed layer:
-	// no budget, no rate measurement, no warnings
-	if (sv_rehlds_movecmdtime_enabled.value <= 0.0f) {
-		return nullDrop;
-	}
 
 	// any slowdown measured on server-zeroed commands would be the engine's
 	// doing, not the client's: the frozen time stays out of the window
@@ -669,9 +666,9 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// sv_maxusrcmdprocessticks. The refill runs slightly faster than real
 	// time: client clocks drift a fraction of a percent ahead of the server,
 	// and without the tolerance such clients sit at an empty budget for good.
-	if (sv_rehlds_movecmd_budget_max.value > 0.0f)
+	if (sv_rehlds_movecmdtime_speedhack_budget.value > 0.0f && sv_rehlds_movecmdtime_budget_max.value > 0.0f)
 	{
-		double budgetMax = sv_rehlds_movecmd_budget_max.value;
+		double budgetMax = sv_rehlds_movecmdtime_budget_max.value;
 		if (firstCmd) {
 			ust->budgetMs = budgetMax;
 		} else if (gapMs > 0) {
@@ -693,6 +690,14 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	}
 
 	ust->avgMsec = (ust->avgMsec == 0.0) ? (double)ucmd->msec : ust->avgMsec * 0.95 + ucmd->msec * 0.05;
+
+	// recent speed snapshots, one per RATE_RECENT_MS of measured wall time
+	if (ust->rateWallMs - ust->recentWallMs >= RATE_RECENT_MS) {
+		ust->recentPrevWallMs = ust->recentWallMs;
+		ust->recentPrevMsecMs = ust->recentMsecMs;
+		ust->recentWallMs = ust->rateWallMs;
+		ust->recentMsecMs = ust->rateMsecMs;
+	}
 
 	// sample a control point every RATE_POINT_STEP_MS of measured wall time
 	if (ust->ratePointCount == 0
@@ -768,15 +773,19 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		if (!stallImmune && now >= ust->lastDetectMs + RATE_WARN_ACCRUE_MS)
 		{
 			ust->lastDetectMs = now;
-			ust->warnings[(int)abuseType]++;
 
+			// warnings accrue only while this cheat's punishment is switched
+			// on; *_warnings N punishes on the N-th one
 			const cvar_t *maxWarnings = (abuseType == ABUSE_SPEEDHACK)
-				? &sv_rehlds_movecmdtime_speedhack_max_warnings : &sv_rehlds_movecmdtime_slowmo_max_warnings;
+				? &sv_rehlds_movecmdtime_speedhack_warnings : &sv_rehlds_movecmdtime_slowmo_warnings;
+			if (maxWarnings->value > 0.0f) {
+				ust->warnings[(int)abuseType]++;
+			}
 			const cvar_t *punish = (abuseType == ABUSE_SPEEDHACK)
 				? &sv_rehlds_movecmdtime_speedhack_punish : &sv_rehlds_movecmdtime_slowmo_punish;
 
-			if (maxWarnings->value >= 0.0f
-				&& ust->warnings[(int)abuseType] > (unsigned int)maxWarnings->value)
+			if (maxWarnings->value > 0.0f
+				&& ust->warnings[(int)abuseType] >= (unsigned int)maxWarnings->value)
 			{
 				const char *punishReason = (abuseType == ABUSE_SPEEDHACK) ? "speedhack" : "slowmo";
 
@@ -878,8 +887,8 @@ void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *
 					// an air-stuck span is a cheat on its own: honest clients
 					// carry the fraction of a millisecond over and never send
 					// a second of zero-time commands
-					if (sv_rehlds_movecmdtime_airstuck_max_warnings.value >= 0.0f
-						&& ust->airstuckCount > (unsigned int)sv_rehlds_movecmdtime_airstuck_max_warnings.value)
+					if (sv_rehlds_movecmdtime_airstuck_warnings.value > 0.0f
+						&& ust->airstuckCount >= (unsigned int)sv_rehlds_movecmdtime_airstuck_warnings.value)
 					{
 						if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
 							MCmd_Log("PUNISH name=%s type=airstuck total=%u stuck=%.1fs",
@@ -1040,23 +1049,14 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 }
 
 // client speed over the last RATE_RECENT_MS..2*RATE_RECENT_MS of measured
-// wall time; the whole window when it is not that long yet
+// wall time
 double CUserCmdTimeLimiter::RecentRate(const usercmd_state_t *ust)
 {
-	for (int i = ust->ratePointCount - 1; i >= 0; i--)
-	{
-		const rate_point_t *p = &ust->ratePoints[i];
-		uint64_t dWall = ust->rateWallMs - p->wallMs;
-		if (dWall >= RATE_RECENT_MS) {
-			return (double)(ust->rateMsecMs - p->msecMs) / (double)dWall;
-		}
+	uint64_t dWall = ust->rateWallMs - ust->recentPrevWallMs;
+	if (dWall == 0) {
+		return 0.0;
 	}
-
-	uint64_t dWall, dMsec;
-	if (WindowTotals(ust, &dWall, &dMsec) && dWall > 0) {
-		return (double)dMsec / (double)dWall;
-	}
-	return 0.0;
+	return (double)(ust->rateMsecMs - ust->recentPrevMsecMs) / (double)dWall;
 }
 
 bool CUserCmdTimeLimiter::WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec)
@@ -1086,6 +1086,8 @@ void CUserCmdTimeLimiter::GetMeasureInfo(unsigned int clientId, measure_info_t *
 	info->detectSpeed = ust->telemWarn[ABUSE_SPEEDHACK];
 	info->detectSlow = ust->telemWarn[ABUSE_SLOWMO];
 	info->budgetClamps = ust->budgetClamps;
+	info->warnSpeed = ust->warnings[ABUSE_SPEEDHACK];
+	info->warnSlow = ust->warnings[ABUSE_SLOWMO];
 	info->nullDrops = ust->nullDrops;
 	info->frozenCmds = ust->frozenCmds;
 	info->airstuckCount = ust->airstuckCount;
@@ -1212,21 +1214,21 @@ void Rehlds_Security_Init() {
 	Cvar_RegisterVariable(&sv_rehlds_movecmd_max_ticks);
 	Cvar_RegisterVariable(&sv_rehlds_movecmd_max_null_streak);
 	Cvar_RegisterVariable(&sv_rehlds_movecmd_clamp_interp);
-	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_enabled);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_max_scale);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_min_scale);
-	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_speedhack_max_warnings);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_speedhack_budget);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_speedhack_warnings);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_speedhack_punish);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_speedhack_drop);
-	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_slowmo_max_warnings);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_slowmo_warnings);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_slowmo_punish);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_debug);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_gap_reset);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_rate_min_window);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_stall_threshold);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_stall_grace);
-	Cvar_RegisterVariable(&sv_rehlds_movecmd_budget_max);
-	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_airstuck_max_warnings);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_budget_max);
+	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_airstuck_warnings);
 	Cvar_RegisterVariable(&sv_rehlds_movecmdtime_airstuck_punish);
 #endif
 }
