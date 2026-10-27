@@ -92,6 +92,7 @@ struct movesim_params_t
 	double holdEvery;
 	double holdLen;
 	int releasePerMs;
+	double releaseIntervalMs;  // > 0: one released packet per this many ms instead (a slow link)
 
 	// AFK: the client generates no commands at all
 	double silenceAt;
@@ -224,6 +225,14 @@ static void MoveSim_Deliver(const movesim_params_t *p, const movesim_packet_t *p
 	s_simLastCmdMsec = frozen ? 0 : pkt->msec[0];
 }
 
+static double MoveSim_ReleaseDelay(const movesim_params_t *p, int i)
+{
+	if (p->releaseIntervalMs > 0.0) {
+		return i * p->releaseIntervalMs * 0.001;
+	}
+	return (i / p->releasePerMs) * 0.001;
+}
+
 static bool MoveSim_InWindow(double t, double every, double len)
 {
 	return every > 0.0 && len > 0.0 && fmod(t, every) < len;
@@ -258,7 +267,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	realtime = 1000.0;
 	g_UserCmdTimeLimiter.ClientConnected(0);
 
-	movesim_packet_t held[256];
+	movesim_packet_t held[1024];
 	int numHeld = 0;
 	movesim_packet_t pkt;
 	byte prev[2] = { 0, 0 };
@@ -347,7 +356,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 		if (!lost)
 		{
 			if (MoveSim_InWindow(t, p->holdEvery, p->holdLen)) {
-				if (numHeld < 256) {
+				if (numHeld < 1024) {
 					held[numHeld++] = pkt;
 				}
 			}
@@ -355,9 +364,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 				// a released hold arrives in a burst: releasePerMs packets
 				// per server frame, then the current packet
 				for (int i = 0; i < numHeld; i++) {
-					MoveSim_Deliver(p, &held[i], t + (i / p->releasePerMs) * 0.001, &lastSeq, res, frozen);
+					MoveSim_Deliver(p, &held[i], t + MoveSim_ReleaseDelay(p, i), &lastSeq, res, frozen);
 				}
-				MoveSim_Deliver(p, &pkt, t + (numHeld / p->releasePerMs) * 0.001, &lastSeq, res, frozen);
+				MoveSim_Deliver(p, &pkt, t + MoveSim_ReleaseDelay(p, numHeld), &lastSeq, res, frozen);
 				numHeld = 0;
 			}
 		}
@@ -848,6 +857,43 @@ TEST(MoveCmdTimeBadNetworkSweep, MoveCmdTime, 20000)
 		char what[128];
 		Q_snprintf(what, sizeof(what), "honest client on a bad network (cpp=%d loss=%u hold=%.1f release=%d backups=%d)",
 			cpps[a], losses[b], holds[c], releases[d], backups[e]);
+		MoveSim_Check(what, res.info.rate == 0.0 || (res.info.rate > 0.93 && res.info.rate < 1.07), &res);
+		MoveSim_Check(what, res.info.detectSlow == 0 && res.info.detectSpeed == 0, &res);
+	}
+}
+
+// a congested link: holds of 0.6-3s drained slowly (one packet per 1-20ms,
+// still faster than the client sends) - the backlog is awaited as long as
+// it keeps catching up, an honest client is measured at its real speed
+TEST(MoveCmdTimeSlowDrainSweep, MoveCmdTime, 20000)
+{
+	int cpps[] = { 1, 3 };
+	double holds[] = { 0.6, 1.0, 2.0, 3.0 };
+	double intervals[] = { 1.0, 3.0, 5.0, 10.0, 20.0 };
+	unsigned int losses[] = { 0, 150 };
+
+	for (int a = 0; a < 2; a++) for (int c = 0; c < 4; c++) for (int d = 0; d < 5; d++) for (int b = 0; b < 2; b++)
+	{
+		// the link must drain faster than the client sends, or the queue
+		// only grows
+		if (intervals[d] >= 10.0 * cpps[a]) {
+			continue;
+		}
+
+		movesim_params_t p;
+		movesim_result_t res;
+		MoveSim_Defaults(&p);
+		p.seconds = 120.0;
+		p.cmdsPerPacket = cpps[a];
+		p.lossPermille = losses[b];
+		p.holdEvery = holds[c] + 3.0;
+		p.holdLen = holds[c];
+		p.releaseIntervalMs = intervals[d];
+		MoveSim_Run(&p, &res);
+
+		char what[128];
+		Q_snprintf(what, sizeof(what), "honest client on a congested link (cpp=%d hold=%.1f drain=%.0fms loss=%u)",
+			cpps[a], holds[c], intervals[d], losses[b]);
 		MoveSim_Check(what, res.info.rate == 0.0 || (res.info.rate > 0.93 && res.info.rate < 1.07), &res);
 		MoveSim_Check(what, res.info.detectSlow == 0 && res.info.detectSpeed == 0, &res);
 	}

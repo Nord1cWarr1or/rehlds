@@ -142,7 +142,8 @@ private:
 		// arrives late for it
 		uint64_t exclFrameMs;      // realtime ms of the frame the last excluded interval opened
 		uint64_t exclDebtMs;       // client time still expected for an excluded silence
-		uint64_t exclDebtSinceMs;  // realtime ms the silence debt was last added
+		uint64_t exclDebtSinceMs;  // realtime ms the silence debt was last added or paid down
+		uint64_t exclDebtLowMs;    // lowest debt since it was last added (catch-up progress)
 		bool cmdsZeroed;           // the engine zeroed the msec of the current packet's commands (FL_FROZEN, paused)
 
 		// air-stuck: a span of commands that keep coming with (almost) no
