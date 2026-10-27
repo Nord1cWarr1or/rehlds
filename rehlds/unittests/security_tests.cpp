@@ -131,6 +131,14 @@ struct movesim_params_t
 	int slowmoWarnings;
 	int airstuckWarnings;
 
+	// sv_rehlds_movecmdtime_debug for the run (1 - observe: the detector
+	// measures and judges with every switch off); with activateAt >= 0 it is
+	// 0 until activateAt, 1 from it, 0 from deactivateAt, 1 from reactivateAt
+	int debug;
+	double activateAt;
+	double deactivateAt;
+	double reactivateAt;
+
 	// sv_rehlds_movecmdtime_speedhack_drop for the run
 	int speedhackDrop;
 
@@ -171,6 +179,7 @@ extern cvar_t sv_rehlds_movecmdtime_speedhack_budget;
 extern cvar_t sv_rehlds_movecmdtime_speedhack_warnings;
 extern cvar_t sv_rehlds_movecmdtime_slowmo_warnings;
 extern cvar_t sv_rehlds_movecmdtime_airstuck_warnings;
+extern cvar_t sv_rehlds_movecmdtime_debug;
 extern cvar_t sv_rehlds_movecmdtime_speedhack_drop;
 
 static double s_simDropAfterRealtime; // drops past this realtime count as droppedAfter
@@ -188,6 +197,10 @@ static void MoveSim_Defaults(movesim_params_t *p)
 	p->numBackup = 2;
 	p->budgetMax = 250.0f;
 	p->speedhackBudget = 1;
+	p->debug = 1;
+	p->activateAt = -1.0;
+	p->deactivateAt = -1.0;
+	p->reactivateAt = -1.0;
 	p->speed = 1.0;
 	p->releasePerMs = 10;
 	p->silenceAt = -1.0;
@@ -278,6 +291,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	float savedSpeedhackWarnings = sv_rehlds_movecmdtime_speedhack_warnings.value;
 	float savedSlowmoWarnings = sv_rehlds_movecmdtime_slowmo_warnings.value;
 	float savedAirstuckWarnings = sv_rehlds_movecmdtime_airstuck_warnings.value;
+	float savedDebug = sv_rehlds_movecmdtime_debug.value;
 	float savedSpeedhackDrop = sv_rehlds_movecmdtime_speedhack_drop.value;
 
 	Q_memset(res, 0, sizeof(*res));
@@ -296,6 +310,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	sv_rehlds_movecmdtime_speedhack_warnings.value = (float)p->speedhackWarnings;
 	sv_rehlds_movecmdtime_slowmo_warnings.value = (float)p->slowmoWarnings;
 	sv_rehlds_movecmdtime_airstuck_warnings.value = (float)p->airstuckWarnings;
+	sv_rehlds_movecmdtime_debug.value = (p->activateAt >= 0.0) ? 0.0f : (float)p->debug;
 	sv_rehlds_movecmdtime_speedhack_drop.value = (float)p->speedhackDrop;
 	s_simDropAfterRealtime = (p->speedLen > 0.0) ? 1000.0 + p->speedAt + p->speedLen + 3.0 : 1.0e12;
 	if (p->minScale > 0.0f) {
@@ -322,6 +337,12 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 
 	for (double t = frameSec; t < p->seconds; t += frameSec)
 	{
+		if (p->activateAt >= 0.0) {
+			bool on = t >= p->activateAt
+				&& !(p->deactivateAt >= 0.0 && t >= p->deactivateAt && !(p->reactivateAt >= 0.0 && t >= p->reactivateAt));
+			sv_rehlds_movecmdtime_debug.value = on ? 1.0f : 0.0f;
+		}
+
 		if (p->levelChangeAt >= 0.0 && t >= p->levelChangeAt && t < p->levelChangeAt + p->levelChangeLen)
 		{
 			if (!inLevelChange) {
@@ -426,6 +447,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	sv_rehlds_movecmdtime_speedhack_warnings.value = savedSpeedhackWarnings;
 	sv_rehlds_movecmdtime_slowmo_warnings.value = savedSlowmoWarnings;
 	sv_rehlds_movecmdtime_airstuck_warnings.value = savedAirstuckWarnings;
+	sv_rehlds_movecmdtime_debug.value = savedDebug;
 	sv_rehlds_movecmdtime_speedhack_drop.value = savedSpeedhackDrop;
 }
 
@@ -837,6 +859,104 @@ TEST(MoveCmdTimeSpeedhack, MoveCmdTime, 5000)
 	MoveSim_Check("speedhack x4 is clipped by the budget", res.info.budgetClamps > 0, &res);
 	MoveSim_Check("speedhack x4 is detected", res.info.detectSpeed > 0, &res);
 	MoveSim_Check("speedhack x4 commands are not dropped by default", res.dropped == 0, &res);
+}
+
+// everything switched off: the detector does nothing at all
+TEST(MoveCmdTimeAllOff, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.speed = 4.0;
+	p.debug = 0;
+	p.speedhackBudget = 0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("all off: nothing is dropped, clipped or measured",
+		res.dropped == 0 && res.info.budgetClamps == 0 && res.info.winSec == 0.0 && res.info.detectSpeed == 0, &res);
+}
+
+// the movement budget alone: clips, judges nothing
+TEST(MoveCmdTimeBudgetOnly, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.speed = 4.0;
+	p.debug = 0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("budget only: the speedhack is clipped, not judged, nothing dropped",
+		res.info.budgetClamps > 0 && res.info.detectSpeed == 0 && res.dropped == 0, &res);
+}
+
+// air-stuck neither punished nor observed: not tracked
+TEST(MoveCmdTimeAirstuckOff, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.stuckAt = 40.0;
+	p.stuckLen = 6.0;
+	p.nullStreak = 20;
+	p.debug = 0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("air-stuck off: not tracked, the null streak limit still works",
+		res.info.airstuckCount == 0 && res.info.nullDrops > 0, &res);
+}
+
+// observation switched on, off and on again mid-game on a lossy network:
+// nothing gathered while off leaks into the measurement
+TEST(MoveCmdTimeActivateMidgame, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.seconds = 120.0;
+	p.lossPermille = 150;
+	p.activateAt = 30.0;
+	p.deactivateAt = 50.0;
+	p.reactivateAt = 60.0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("switched on mid-game: measured at real speed", res.info.rate > 0.98 && res.info.rate < 1.02, &res);
+	MoveSim_Check("switched on mid-game: no verdict", res.info.detectSlow == 0 && res.info.detectSpeed == 0, &res);
+}
+
+// a speedhack measured, the detector switched off for a minute while the
+// client plays fair (the budget keeps running), then on again: the old
+// window is gone, not judged anew
+TEST(MoveCmdTimeReactivateFresh, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.seconds = 110.0;
+	p.speed = 4.0;
+	p.speedAt = 0.0;
+	p.speedLen = 40.0;
+	p.activateAt = 0.0;
+	p.deactivateAt = 40.0;
+	p.reactivateAt = 100.0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("switched on again: the window starts over", res.info.winSec < 15.0, &res);
+}
+
+// the measurement runs for the speedhack switch, slowmo accrues no warning
+TEST(MoveCmdTimeVerdictsPerSwitch, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.speed = 0.4;
+	p.debug = 0;
+	p.speedhackWarnings = 3;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("slowmo is judged while the speedhack switch is on", res.info.detectSlow > 0, &res);
+	MoveSim_Check("slowmo accrues no warning without its own switch", res.info.warnSlow == 0, &res);
 }
 
 // warnings accrue only while the cheat's punishment is switched on

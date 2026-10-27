@@ -109,6 +109,27 @@ static void MCmd_Punish(client_t *cl, const char *reason, const char *metric, do
 	SV_DropClient(cl, FALSE, va("Banned for %s", reason));
 }
 
+// which parts of the movecmdtime detector have a user right now
+static bool MCmd_MeasureWanted()
+{
+	return sv_rehlds_movecmdtime_speedhack_drop.value > 0.0f
+		|| sv_rehlds_movecmdtime_speedhack_warnings.value > 0.0f
+		|| sv_rehlds_movecmdtime_slowmo_warnings.value > 0.0f
+		|| sv_rehlds_movecmdtime_debug.value >= 1.0f;
+}
+
+static bool MCmd_AirstuckWanted()
+{
+	return sv_rehlds_movecmdtime_airstuck_warnings.value > 0.0f
+		|| sv_rehlds_movecmdtime_debug.value >= 1.0f;
+}
+
+static bool MCmd_BudgetWanted()
+{
+	return sv_rehlds_movecmdtime_speedhack_budget.value > 0.0f
+		&& sv_rehlds_movecmdtime_budget_max.value > 0.0f;
+}
+
 CMoveCommandRateLimiter::CMoveCommandRateLimiter() {
 	Q_memset(m_AverageMoveCmdRate, 0, sizeof(m_AverageMoveCmdRate));
 	Q_memset(m_CurrentMoveCmds, 0, sizeof(m_CurrentMoveCmds));
@@ -430,11 +451,24 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// speed judgment.
 	bool serverFrozen = ust->cmdsZeroed;
 	if (serverFrozen) {
-		ust->frozenCmds++;
 		ust->consecutiveNullCmds = 0;
 	}
 
+	// each part of the detector runs only while something uses it: its
+	// switch, or sv_rehlds_movecmdtime_debug (observation, log only)
+	bool measure = MCmd_MeasureWanted();
+	bool airstuck = MCmd_AirstuckWanted();
+	bool budget = MCmd_BudgetWanted();
+
+	if (serverFrozen && (measure || airstuck || budget)) {
+		ust->frozenCmds++;
+	}
+
 	// air-stuck sees every command the client sent, before any drop gate
+	if (!airstuck) {
+		EndNullSpan(clientId, ust);
+	}
+	else
 	{
 		if (serverFrozen) {
 			EndNullSpan(clientId, ust);
@@ -524,6 +558,17 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// Time speed detection
 	//
 
+	if (!measure && !budget) {
+		ust->measureOn = false;
+		return nullDrop;
+	}
+
+	// switched on mid-game: what was gathered while off (or before it was
+	// switched off) is stale, the measurement starts from a first command
+	if (measure && !ust->measureOn) {
+		ResetMeasure(ust);
+	}
+	ust->measureOn = measure;
 
 	// any slowdown measured on server-zeroed commands would be the engine's
 	// doing, not the client's: the frozen time stays out of the window
@@ -532,6 +577,16 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 			ust->lastUpdateTime = now;
 		}
 		return false;
+	}
+
+	// the movement budget alone, nothing is measured
+	if (!measure)
+	{
+		uint64_t gapMs = (ust->lastUpdateTime != 0 && now > ust->lastUpdateTime) ? (now - ust->lastUpdateTime) : 0;
+		bool firstCmd = (ust->lastUpdateTime == 0);
+		ust->lastUpdateTime = now;
+		ApplyBudget(cl, ust, ucmd, gapMs, firstCmd);
+		return nullDrop;
 	}
 
 	// first command after a clockwindow ignore window; vanilla skipped every
@@ -658,35 +713,8 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		ust->exclGapMs += gapMs;
 	}
 
-	// Movement-time budget: the allowance refills with real wall time (up
-	// to the cap) and each command spends the msec it asks for, so ordinary
-	// speedhacks lose their effect on the first depleted command. A burst
-	// after a lag is covered only up to the cap - the excess is clipped and
-	// the client re-predicts back, the same behavior CS:GO ships with
-	// sv_maxusrcmdprocessticks. The refill runs slightly faster than real
-	// time: client clocks drift a fraction of a percent ahead of the server,
-	// and without the tolerance such clients sit at an empty budget for good.
-	if (sv_rehlds_movecmdtime_speedhack_budget.value > 0.0f && sv_rehlds_movecmdtime_budget_max.value > 0.0f)
-	{
-		double budgetMax = sv_rehlds_movecmdtime_budget_max.value;
-		if (firstCmd) {
-			ust->budgetMs = budgetMax;
-		} else if (gapMs > 0) {
-			double refilled = ust->budgetMs + gapMs * BUDGET_REFILL_TOLERANCE;
-			ust->budgetMs = (refilled > budgetMax) ? budgetMax : refilled;
-		}
-
-		if (ucmd->msec > ust->budgetMs)
-		{
-			ust->budgetClamps++;
-			if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastDropLogTime >= 5.0) {
-				ust->lastDropLogTime = realtime;
-				MCmd_Log("BUDGET-CLAMP name=%s total=%u asked=%u granted=%ums",
-					cl->name, ust->budgetClamps, (unsigned)ucmd->msec, (unsigned)(byte)ust->budgetMs);
-			}
-			ucmd->msec = (byte)ust->budgetMs;
-		}
-		ust->budgetMs -= ucmd->msec;
+	if (budget) {
+		ApplyBudget(cl, ust, ucmd, gapMs, firstCmd);
 	}
 
 	ust->avgMsec = (ust->avgMsec == 0.0) ? (double)ucmd->msec : ust->avgMsec * 0.95 + ucmd->msec * 0.05;
@@ -1048,6 +1076,58 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		elapsedMs / 1000.0);
 }
 
+// Movement-time budget: the allowance refills with real wall time (up to the
+// cap) and each command spends the msec it asks for, so ordinary speedhacks
+// lose their effect on the first depleted command. A burst after a lag is
+// covered only up to the cap - the excess is clipped and the client
+// re-predicts back, the same behavior CS:GO ships with
+// sv_maxusrcmdprocessticks. The refill runs slightly faster than real time:
+// client clocks drift a fraction of a percent ahead of the server, and
+// without the tolerance such clients sit at an empty budget for good.
+void CUserCmdTimeLimiter::ApplyBudget(client_t *cl, usercmd_state_t *ust, usercmd_t *ucmd, uint64_t gapMs, bool firstCmd)
+{
+	double budgetMax = sv_rehlds_movecmdtime_budget_max.value;
+	if (firstCmd) {
+		ust->budgetMs = budgetMax;
+	} else if (gapMs > 0) {
+		double refilled = ust->budgetMs + gapMs * BUDGET_REFILL_TOLERANCE;
+		ust->budgetMs = (refilled > budgetMax) ? budgetMax : refilled;
+	}
+
+	if (ucmd->msec > ust->budgetMs)
+	{
+		ust->budgetClamps++;
+		if (sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastDropLogTime >= 5.0) {
+			ust->lastDropLogTime = realtime;
+			MCmd_Log("BUDGET-CLAMP name=%s total=%u asked=%u granted=%ums",
+				cl->name, ust->budgetClamps, (unsigned)ucmd->msec, (unsigned)(byte)ust->budgetMs);
+		}
+		ucmd->msec = (byte)ust->budgetMs;
+	}
+	ust->budgetMs -= ucmd->msec;
+}
+
+// the speed measurement starts over: nothing gathered before is valid
+void CUserCmdTimeLimiter::ResetMeasure(usercmd_state_t *ust)
+{
+	ust->lastUpdateTime = 0;
+	ust->ratePointCount = 0;
+	ust->rateWallMs = 0;
+	ust->rateMsecMs = 0;
+	ust->recentWallMs = 0;
+	ust->recentMsecMs = 0;
+	ust->recentPrevWallMs = 0;
+	ust->recentPrevMsecMs = 0;
+	ust->pendingDroppedMsec = 0;
+	ust->pendingLostMsec = 0;
+	ust->exclDebtMs = 0;
+	ust->exclDebtLowMs = 0;
+	ust->exclDebtSinceMs = 0;
+	ust->exclFrameMs = 0;
+	ust->lastDetectMs = 0;
+	ust->stableSinceMs = 0;
+}
+
 // client speed over the last RATE_RECENT_MS..2*RATE_RECENT_MS of measured
 // wall time
 double CUserCmdTimeLimiter::RecentRate(const usercmd_state_t *ust)
@@ -1101,6 +1181,10 @@ void CUserCmdTimeLimiter::OnClockWindowSet(unsigned int clientId, double dif)
 	client_t *cl = &g_psvs.clients[clientId];
 	usercmd_state_t *ust = &m_States[clientId];
 
+	if (!MCmd_MeasureWanted() && !MCmd_AirstuckWanted()) {
+		return;
+	}
+
 	ust->cwCount++;
 	ust->cwActive = true;
 
@@ -1113,6 +1197,10 @@ void CUserCmdTimeLimiter::OnClockWindowSet(unsigned int clientId, double dif)
 void CUserCmdTimeLimiter::OnCmdSkippedByClockWindow(unsigned int clientId)
 {
 	usercmd_state_t *ust = &m_States[clientId];
+
+	if (!MCmd_MeasureWanted() && !MCmd_AirstuckWanted()) {
+		return;
+	}
 
 	ust->cwActive = true;
 	ust->cwSkippedCmds++;
@@ -1127,6 +1215,10 @@ void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int n
 	usercmd_state_t *ust = &m_States[clientId];
 
 	ust->cmdsZeroed = cmdsZeroed;
+
+	if (!MCmd_MeasureWanted() && !MCmd_AirstuckWanted()) {
+		return;
+	}
 
 	// net_drop counts lost commands, not packets: the client gives every
 	// command a sequence number, held-back ones too (fps above cl_cmdrate),
@@ -1238,15 +1330,18 @@ void Rehlds_Security_Shutdown() {
 
 void Rehlds_Security_Frame() {
 #ifdef REHLDS_FIXES
-	// frame-to-frame stall detection (see the stall state above); runs
-	// independently of debug - it must work while the detector is on
+	// frame-to-frame stall detection (see the stall state above); it only
+	// serves slowmo judgments, so it runs while they are used
 	if (g_lastFrameRealtime < 0.0) {
 		g_lastFrameRealtime = realtime;
 	}
 	double frameDelta = realtime - g_lastFrameRealtime;
 	g_lastFrameRealtime = realtime;
 
-	if (sv_rehlds_movecmdtime_stall_threshold.value > 0.0f
+	bool slowmoJudged = sv_rehlds_movecmdtime_slowmo_warnings.value > 0.0f
+		|| sv_rehlds_movecmdtime_debug.value >= 1.0f;
+
+	if (slowmoJudged && sv_rehlds_movecmdtime_stall_threshold.value > 0.0f
 		&& frameDelta > sv_rehlds_movecmdtime_stall_threshold.value)
 	{
 		g_stallUntil = realtime + sv_rehlds_movecmdtime_stall_grace.value;
@@ -1258,7 +1353,9 @@ void Rehlds_Security_Frame() {
 		}
 	}
 
-	ServerStatsFrame(frameDelta);
+	if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
+		ServerStatsFrame(frameDelta);
+	}
 
 	g_MoveCommandRateLimiter.Frame();
 	g_StringCommandsRateLimiter.Frame();

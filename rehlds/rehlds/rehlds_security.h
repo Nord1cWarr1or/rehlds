@@ -150,6 +150,7 @@ private:
 		uint64_t exclDebtMs;       // client time still expected for an excluded silence
 		uint64_t exclDebtSinceMs;  // realtime ms the silence debt was last added or paid down
 		uint64_t exclDebtLowMs;    // lowest debt since it was last added (catch-up progress)
+		bool measureOn;            // the speed measurement ran on the previous command
 		bool cmdsZeroed;           // the engine zeroed the msec of the current packet's commands (FL_FROZEN, paused)
 
 		// air-stuck: a span of commands that keep coming with (almost) no
@@ -203,6 +204,8 @@ private:
 	void EndNullSpan(unsigned int clientId, usercmd_state_t *ust);
 	static bool WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec);
 	static double RecentRate(const usercmd_state_t *ust);
+	void ApplyBudget(client_t *cl, usercmd_state_t *ust, usercmd_t *ucmd, uint64_t gapMs, bool firstCmd);
+	void ResetMeasure(usercmd_state_t *ust);
 };
 
 extern CUserCmdTimeLimiter g_UserCmdTimeLimiter;
