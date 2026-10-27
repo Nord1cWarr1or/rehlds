@@ -88,6 +88,7 @@ public:
 		unsigned int budgetClamps;
 		unsigned int warnSpeed;    // speedhack warnings accrued towards the punishment
 		unsigned int warnSlow;     // slowmo warnings accrued towards the punishment
+		unsigned int warnAirstuck; // air-stuck warnings accrued towards the punishment
 		unsigned int nullDrops;    // commands dropped by the null-command streak limit
 		unsigned int frozenCmds;   // commands the engine zeroed itself (FL_FROZEN, paused)
 		unsigned int airstuckCount; // spans of commands that kept coming with no game time
@@ -150,6 +151,7 @@ private:
 		uint64_t exclDebtMs;       // client time still expected for an excluded silence
 		uint64_t exclDebtSinceMs;  // realtime ms the silence debt was last added or paid down
 		uint64_t exclDebtLowMs;    // lowest debt since it was last added (catch-up progress)
+		bool budgetOn;             // the movement budget ran on the previous command
 		bool measureOn;            // the speed measurement ran on the previous command
 		bool cmdsZeroed;           // the engine zeroed the msec of the current packet's commands (FL_FROZEN, paused)
 
@@ -176,6 +178,7 @@ private:
 		unsigned int nullDrops;         // cmds dropped by sv_rehlds_movecmd_max_null_streak
 		unsigned int frozenCmds;        // cmds whose msec the engine zeroed itself (FL_FROZEN, paused)
 		unsigned int airstuckCount;     // air-stuck spans
+		unsigned int airstuckWarnings;  // air-stuck warnings accrued towards the punishment (switch on)
 		uint64_t airstuckMs;            // real time of the air-stuck spans
 		unsigned int interpDrops;       // cmds dropped by sv_rehlds_movecmd_clamp_interp
 		unsigned int budgetClamps;      // commands clipped by the movement-time budget

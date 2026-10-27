@@ -464,6 +464,12 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	bool airstuck = MCmd_AirstuckWanted();
 	bool budget = MCmd_BudgetWanted();
 
+	// a budget switched on mid-game starts full, like on the first command
+	if (budget && !ust->budgetOn) {
+		ust->budgetMs = sv_rehlds_movecmdtime_budget_max.value;
+	}
+	ust->budgetOn = budget;
+
 	if (serverFrozen && (measure || airstuck || budget)) {
 		ust->frozenCmds++;
 	}
@@ -910,6 +916,9 @@ void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *
 					ust->stuckFlagged = true;
 					ust->stuckNextWarnMs += AIRSTUCK_WARN_STEP_MS;
 					ust->airstuckCount++;
+					if (sv_rehlds_movecmdtime_airstuck_warnings.value > 0.0f) {
+						ust->airstuckWarnings++;
+					}
 					client_t *cl = &g_psvs.clients[clientId];
 					if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
 						MCmd_Log("WARN name=%s type=airstuck total=%u stuck=%.1fs nullDrops=%u (commands keep coming with no game time)",
@@ -920,7 +929,7 @@ void CUserCmdTimeLimiter::TrackNullSpan(unsigned int clientId, usercmd_state_t *
 					// carry the fraction of a millisecond over and never send
 					// a second of zero-time commands
 					if (sv_rehlds_movecmdtime_airstuck_warnings.value > 0.0f
-						&& ust->airstuckCount >= (unsigned int)sv_rehlds_movecmdtime_airstuck_warnings.value)
+						&& ust->airstuckWarnings >= (unsigned int)sv_rehlds_movecmdtime_airstuck_warnings.value)
 					{
 						if (sv_rehlds_movecmdtime_debug.value >= 1.0f) {
 							MCmd_Log("PUNISH name=%s type=airstuck total=%u stuck=%.1fs",
@@ -1115,6 +1124,10 @@ void CUserCmdTimeLimiter::ApplyBudget(client_t *cl, usercmd_state_t *ust, usercm
 void CUserCmdTimeLimiter::ResetMeasure(usercmd_state_t *ust)
 {
 	ust->lastUpdateTime = 0;
+	ust->joinTime = 0;
+	ust->totalMsec = 0;
+	ust->cwActive = false;
+	ust->cwSkippedCmds = 0;
 	ust->ratePointCount = 0;
 	ust->rateWallMs = 0;
 	ust->rateMsecMs = 0;
@@ -1172,6 +1185,7 @@ void CUserCmdTimeLimiter::GetMeasureInfo(unsigned int clientId, measure_info_t *
 	info->budgetClamps = ust->budgetClamps;
 	info->warnSpeed = ust->warnings[ABUSE_SPEEDHACK];
 	info->warnSlow = ust->warnings[ABUSE_SLOWMO];
+	info->warnAirstuck = ust->airstuckWarnings;
 	info->nullDrops = ust->nullDrops;
 	info->frozenCmds = ust->frozenCmds;
 	info->airstuckCount = ust->airstuckCount;

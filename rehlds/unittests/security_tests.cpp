@@ -125,6 +125,7 @@ struct movesim_params_t
 	// sv_rehlds_movecmdtime_budget_max and _speedhack_budget for the run
 	float budgetMax;
 	int speedhackBudget;
+	double budgetAt;           // >= 0: speedhackBudget applies only from this time
 
 	// sv_rehlds_movecmdtime_*_warnings for the run
 	int speedhackWarnings;
@@ -199,6 +200,7 @@ static void MoveSim_Defaults(movesim_params_t *p)
 	p->speedhackBudget = 1;
 	p->debug = 1;
 	p->activateAt = -1.0;
+	p->budgetAt = -1.0;
 	p->deactivateAt = -1.0;
 	p->reactivateAt = -1.0;
 	p->speed = 1.0;
@@ -337,6 +339,10 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 
 	for (double t = frameSec; t < p->seconds; t += frameSec)
 	{
+		if (p->budgetAt >= 0.0) {
+			sv_rehlds_movecmdtime_speedhack_budget.value = (t >= p->budgetAt) ? (float)p->speedhackBudget : 0.0f;
+		}
+
 		if (p->activateAt >= 0.0) {
 			bool on = t >= p->activateAt
 				&& !(p->deactivateAt >= 0.0 && t >= p->deactivateAt && !(p->reactivateAt >= 0.0 && t >= p->reactivateAt));
@@ -957,6 +963,34 @@ TEST(MoveCmdTimeVerdictsPerSwitch, MoveCmdTime, 5000)
 
 	MoveSim_Check("slowmo is judged while the speedhack switch is on", res.info.detectSlow > 0, &res);
 	MoveSim_Check("slowmo accrues no warning without its own switch", res.info.warnSlow == 0, &res);
+}
+
+// the budget switched on while the measurement runs starts full: an
+// honest client is never clipped
+TEST(MoveCmdTimeBudgetOnMidgame, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.fps = 300;
+	p.budgetAt = 30.0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("a budget switched on mid-game does not clip an honest client", res.info.budgetClamps == 0, &res);
+}
+
+// air-stuck observed with its switch off accrues no punishment warning
+TEST(MoveCmdTimeAirstuckObserved, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.stuckAt = 30.0;
+	p.stuckLen = 12.0;
+	MoveSim_Run(&p, &res);
+
+	MoveSim_Check("observed air-stuck is judged", res.info.airstuckCount > 0, &res);
+	MoveSim_Check("observed air-stuck accrues no punishment warning", res.info.warnAirstuck == 0, &res);
 }
 
 // warnings accrue only while the cheat's punishment is switched on
