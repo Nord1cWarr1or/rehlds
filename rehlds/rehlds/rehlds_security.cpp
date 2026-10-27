@@ -179,11 +179,13 @@ void CMoveCommandRateLimiter::CheckBurstRate(unsigned int clientId) {
 	}
 	if ((m_CurrentMoveCmds[clientId] / dt) > sv_rehlds_movecmdrate_max_burst.value) {
 		if(sv_rehlds_movecmdrate_burst_punish.value < 0) {
+			MCmd_Log("KICK-MOVECMDRATE name=%s type=burst rate=%.1f action=kick", cl->name, (m_CurrentMoveCmds[clientId] / dt));
 			Con_DPrintf("%s Kicked for move commands flooding (burst) (%.1f)\n", cl->name, (m_CurrentMoveCmds[clientId] / dt));
 			SV_DropClient(cl, false, "Kicked for move commands flooding (burst)");
 		}
 		else
 		{
+			MCmd_Log("KICK-MOVECMDRATE name=%s type=burst rate=%.1f action=ban", cl->name, (m_CurrentMoveCmds[clientId] / dt));
 			Con_DPrintf("%s Banned for move commands flooding (burst) (%.1f)\n", cl->name, (m_CurrentMoveCmds[clientId] / dt));
 			Cbuf_AddText(va("addip %.1f %s\n", sv_rehlds_movecmdrate_burst_punish.value, NET_BaseAdrToString(cl->netchan.remote_address)));
 			SV_DropClient(cl, false, "Banned for move commands flooding (burst)");
@@ -199,11 +201,13 @@ void CMoveCommandRateLimiter::CheckAverageRate(unsigned int clientId) {
 
 	if (m_AverageMoveCmdRate[clientId] > sv_rehlds_movecmdrate_max_avg.value) {
 		if(sv_rehlds_movecmdrate_avg_punish.value < 0) {
+			MCmd_Log("KICK-MOVECMDRATE name=%s type=avg rate=%.1f action=kick", cl->name, m_AverageMoveCmdRate[clientId]);
 			Con_DPrintf("%s Kicked for move commands flooding (Avg) (%.1f)\n", cl->name, m_AverageMoveCmdRate[clientId]);
 			SV_DropClient(cl, false, "Kicked for move commands flooding (Avg)");
 		}
 		else
 		{
+			MCmd_Log("KICK-MOVECMDRATE name=%s type=avg rate=%.1f action=ban", cl->name, m_AverageMoveCmdRate[clientId]);
 			Con_DPrintf("%s Banned for move commands flooding (Avg) (%.1f)\n", cl->name, m_AverageMoveCmdRate[clientId]);
 			Cbuf_AddText(va("addip %.1f %s\n", sv_rehlds_movecmdrate_avg_punish.value, NET_BaseAdrToString(cl->netchan.remote_address)));
 			SV_DropClient(cl, false, "Banned for move commands flooding (Avg)");
