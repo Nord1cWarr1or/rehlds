@@ -387,6 +387,8 @@ void CUserCmdTimeLimiter::ClientConnected(unsigned int clientId)
 #define RATE_EXCL_DEBT_AGE_MS 1000   // late client time for an excluded span is awaited this long after it stops catching up
 #define RATE_EXCL_DEBT_STEP_MS 20    // debt paid down by this much more counts as catch-up progress
 #define RATE_FIRST_CMD_DEBT_MS 10000 // a backlog the first commands may bring, awaited like a silence's
+#define RATE_LATE_RESERVE_MAX_MS 8000   // late client time of expired debts kept for a catch-up that comes after all
+#define RATE_LATE_RESERVE_AGE_MS 30000  // the late reserve is dropped this long after it was last added to
 #define LOSS_HEAVY_SHARE      0.8    // telemetry: share of a dump period's client time estimated for lost commands that is logged
 #define CLIENT_FRAME_CAP_MSEC 250    // the client caps a frame at 250ms (Host_FilterTime), a longer one reports only that
 #define AIRSTUCK_MIN_MS       1000   // commands with no client time in them for this long are an air-stuck
@@ -422,7 +424,7 @@ struct mcmd_server_stats_t {
 static mcmd_server_stats_t g_serverStats;
 static double g_nextServerStatsTime = 0.0;
 
-void CUserCmdTimeLimiter::PushRatePoint(usercmd_state_t *ust)
+void CUserCmdTimeLimiter::PushRatePoint(usercmd_state_t *ust, int pingMs)
 {
 	if (ust->ratePointCount == RATE_POINTS_MAX) {
 		memmove(&ust->ratePoints[0], &ust->ratePoints[1], sizeof(rate_point_t) * (RATE_POINTS_MAX - 1));
@@ -431,6 +433,7 @@ void CUserCmdTimeLimiter::PushRatePoint(usercmd_state_t *ust)
 
 	ust->ratePoints[ust->ratePointCount].wallMs = ust->rateWallMs;
 	ust->ratePoints[ust->ratePointCount].msecMs = ust->rateMsecMs;
+	ust->ratePoints[ust->ratePointCount].pingMs = pingMs;
 	ust->ratePointCount++;
 }
 
@@ -640,7 +643,18 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 
 	bool debtOpen = (ust->exclDebtMs > 0 && now - ust->exclDebtSinceMs <= RATE_EXCL_DEBT_AGE_MS);
 	if (!debtOpen) {
+		// The client stopped catching up, yet the late time may still come:
+		// a link whose delay grew drains it only once the delay shrinks,
+		// seconds later. The real part of the debt is kept as the late
+		// reserve - a catch-up beyond real time is counted against it, not
+		// as speed. It is time the client has not played, spent once.
+		if (ust->exclDebtMs > ust->exclDebtGuessMs) {
+			uint64_t reserve = ust->lateReserveMs + (ust->exclDebtMs - ust->exclDebtGuessMs);
+			ust->lateReserveMs = (reserve > RATE_LATE_RESERVE_MAX_MS) ? RATE_LATE_RESERVE_MAX_MS : reserve;
+			ust->lateReserveSinceMs = now;
+		}
 		ust->exclDebtMs = 0;
+		ust->exclDebtGuessMs = 0;
 	}
 
 	bool intervalValid;
@@ -659,6 +673,9 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		// catching up.
 		intervalValid = false;
 		ust->exclDebtMs += firstCmd ? RATE_FIRST_CMD_DEBT_MS : gapMs;
+		if (firstCmd) {
+			ust->exclDebtGuessMs += RATE_FIRST_CMD_DEBT_MS;
+		}
 		ust->exclDebtLowMs = ust->exclDebtMs;
 		ust->exclDebtSinceMs = now;
 		ust->exclFrameMs = now;
@@ -708,6 +725,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	if (intervalValid) {
 		ust->rateWallMs += gapMs;
 		ust->rateMsecMs += delivered;
+		AbsorbLateTime(ust, now);
 	}
 	else {
 		// The excluded interval's client time pays back the time a silence
@@ -719,6 +737,11 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		if (ust->exclDebtMs + RATE_EXCL_DEBT_STEP_MS <= ust->exclDebtLowMs) {
 			ust->exclDebtLowMs = ust->exclDebtMs;
 			ust->exclDebtSinceMs = now;
+		}
+		// time that arrives pays the guess first: what is left of the debt
+		// above it is real time the client still owes
+		if (ust->exclDebtGuessMs > ust->exclDebtMs) {
+			ust->exclDebtGuessMs = ust->exclDebtMs;
 		}
 		ust->exclGapMs += gapMs;
 	}
@@ -741,7 +764,7 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	if (ust->ratePointCount == 0
 		|| ust->rateWallMs - ust->ratePoints[ust->ratePointCount - 1].wallMs >= RATE_POINT_STEP_MS)
 	{
-		PushRatePoint(ust);
+		PushRatePoint(ust, SV_CalcPing(cl));
 	}
 
 	// measure the client's game-time speed over the sliding window
@@ -796,14 +819,19 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		if (!stallImmune && sv_rehlds_movecmdtime_debug.value >= 1.0f && realtime - ust->lastWarnLogTime >= 2.0)
 		{
 			ust->lastWarnLogTime = realtime;
-			MCmd_Log("WARN name=%s type=%s total=%u rate=%.2f winSec=%.1f avgMsec=%.1f fps~%.0f loss=%u cw=%u drops(t=%u n=%u i=%u)",
+			// ping growth over the window: the delay a congested link adds
+			// to the commands, which a slowmo verdict cannot tell apart from
+			// a slowed client - adj is the speed with it given back
+			int pingDelta = WindowPingDelta(ust);
+			MCmd_Log("WARN name=%s type=%s total=%u rate=%.2f winSec=%.1f avgMsec=%.1f fps~%.0f loss=%u cw=%u drops(t=%u n=%u i=%u) ping=(%d d:%+d adj:%.2f)",
 				cl->name,
 				(abuseType == ABUSE_SPEEDHACK) ? "speedhack" : "slowmo",
 				ust->telemWarn[(int)abuseType],
 				rate, winSec, ust->avgMsec,
 				(ust->avgMsec >= 0.1) ? (1000.0 / ust->avgMsec) : 0.0,
 				(unsigned int)cl->packet_loss,
-				ust->cwCount, ust->ticksDrops, ust->nullDrops, ust->interpDrops);
+				ust->cwCount, ust->ticksDrops, ust->nullDrops, ust->interpDrops,
+				SV_CalcPing(cl), pingDelta, ((double)dMsec + pingDelta) / (double)dWall);
 		}
 
 		// one warning per RATE_WARN_ACCRUE_MS of the ongoing episode: a
@@ -1068,7 +1096,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 
 	// clockRate drifts permanently after speedhack sessions (reported msec
 	// cannot be unreported) - rate above is the live metric
-	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u est:%.0fs) excl=(g:%.0fs) air=(n:%u t:%.0fs) frz=%u msec=%llums age=%.0fs",
+	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u est:%.0fs) excl=(g:%.0fs late:%.1fs) air=(n:%u t:%.0fs) frz=%u ping=(%d d:%+d adj:%.2f) msec=%llums age=%.0fs",
 		cl->name,
 		info.rate, info.winSec, clockRate,
 		ust->avgMsec,
@@ -1082,9 +1110,11 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		ust->cwCount, ust->cwSkippedTotal,
 		ust->rateRestarts,
 		ust->replayedCmds, ust->lostCmds, ust->lostEstMs / 1000.0,
-		ust->exclGapMs / 1000.0,
+		ust->exclGapMs / 1000.0, ust->lateUsedMs / 1000.0,
 		ust->airstuckCount, ust->airstuckMs / 1000.0,
 		ust->frozenCmds,
+		SV_CalcPing(cl), info.pingDeltaMs,
+		(info.winSec > 0.0) ? info.rate + info.pingDeltaMs / (info.winSec * 1000.0) : 0.0,
 		(unsigned long long)ust->totalMsec,
 		elapsedMs / 1000.0);
 }
@@ -1140,9 +1170,49 @@ void CUserCmdTimeLimiter::ResetMeasure(usercmd_state_t *ust)
 	ust->exclDebtMs = 0;
 	ust->exclDebtLowMs = 0;
 	ust->exclDebtSinceMs = 0;
+	ust->exclDebtGuessMs = 0;
+	ust->lateReserveMs = 0;
+	ust->lateReserveSinceMs = 0;
 	ust->exclFrameMs = 0;
 	ust->lastDetectMs = 0;
 	ust->stableSinceMs = 0;
+}
+
+// A catch-up of time an expired debt gave up on: the client time measured
+// since the latest recent-speed snapshot beyond its wall time is taken out
+// of the window while the late reserve lasts. The take never goes below a
+// stored rate point, so the window stays monotonic.
+void CUserCmdTimeLimiter::AbsorbLateTime(usercmd_state_t *ust, uint64_t now)
+{
+	if (ust->lateReserveMs == 0) {
+		return;
+	}
+	if (now - ust->lateReserveSinceMs > RATE_LATE_RESERVE_AGE_MS) {
+		ust->lateReserveMs = 0;
+		return;
+	}
+
+	uint64_t dWall = ust->rateWallMs - ust->recentWallMs;
+	uint64_t dMsec = ust->rateMsecMs - ust->recentMsecMs;
+	if (dMsec <= dWall) {
+		return;
+	}
+
+	uint64_t take = dMsec - dWall;
+	if (take > ust->lateReserveMs) {
+		take = ust->lateReserveMs;
+	}
+	if (ust->ratePointCount > 0) {
+		uint64_t pointMsec = ust->ratePoints[ust->ratePointCount - 1].msecMs;
+		uint64_t room = (ust->rateMsecMs > pointMsec) ? (ust->rateMsecMs - pointMsec) : 0;
+		if (take > room) {
+			take = room;
+		}
+	}
+
+	ust->rateMsecMs -= take;
+	ust->lateReserveMs -= take;
+	ust->lateUsedMs += take;
 }
 
 // client speed over the last RATE_RECENT_MS..2*RATE_RECENT_MS of measured
@@ -1154,6 +1224,15 @@ double CUserCmdTimeLimiter::RecentRate(const usercmd_state_t *ust)
 		return 0.0;
 	}
 	return (double)(ust->rateMsecMs - ust->recentPrevMsecMs) / (double)dWall;
+}
+
+// ping change from the oldest rate point of the window to the newest
+int CUserCmdTimeLimiter::WindowPingDelta(const usercmd_state_t *ust)
+{
+	if (ust->ratePointCount < 2) {
+		return 0;
+	}
+	return ust->ratePoints[ust->ratePointCount - 1].pingMs - ust->ratePoints[0].pingMs;
 }
 
 bool CUserCmdTimeLimiter::WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec)
@@ -1179,6 +1258,10 @@ void CUserCmdTimeLimiter::GetMeasureInfo(unsigned int clientId, measure_info_t *
 		info->rate = (double)dMsec / (double)dWall;
 		info->winSec = dWall / 1000.0;
 	}
+	if (ust->ratePointCount > 0) {
+		info->pingMs = ust->ratePoints[ust->ratePointCount - 1].pingMs;
+	}
+	info->pingDeltaMs = WindowPingDelta(ust);
 
 	info->detectSpeed = ust->telemWarn[ABUSE_SPEEDHACK];
 	info->detectSlow = ust->telemWarn[ABUSE_SLOWMO];
@@ -1192,6 +1275,7 @@ void CUserCmdTimeLimiter::GetMeasureInfo(unsigned int clientId, measure_info_t *
 	info->airstuckMs = ust->airstuckMs;
 	info->exclGapMs = ust->exclGapMs;
 	info->lostEstMs = ust->lostEstMs;
+	info->lateUsedMs = ust->lateUsedMs;
 }
 
 void CUserCmdTimeLimiter::OnClockWindowSet(unsigned int clientId, double dif)

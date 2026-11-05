@@ -94,6 +94,18 @@ struct movesim_params_t
 	int releasePerMs;
 	double releaseIntervalMs;  // > 0: one released packet per this many ms instead (a slow link)
 
+	// latency swing: from lagAt the link delay grows to lagMax over lagUp
+	// seconds (with lagClump > 0 the commands come in bursts every lagClump
+	// seconds, a stutter), stays for lagHold seconds, then shrinks back to
+	// nothing over lagDown seconds - the late commands come faster than
+	// real time
+	double lagAt;
+	double lagUp;
+	double lagMax;
+	double lagHold;
+	double lagDown;
+	double lagClump;
+
 	// AFK: the client generates no commands at all
 	double silenceAt;
 	double silenceLen;
@@ -119,8 +131,9 @@ struct movesim_params_t
 	// sv_rehlds_movecmd_max_null_streak for the run
 	int nullStreak;
 
-	// sv_rehlds_movecmdtime_min_scale for the run, 0 - keep the default
+	// sv_rehlds_movecmdtime_min_scale / _max_scale for the run, 0 - keep the default
 	float minScale;
+	float maxScale;
 
 	// sv_rehlds_movecmdtime_budget_max and _speedhack_budget for the run
 	float budgetMax;
@@ -175,6 +188,7 @@ struct movesim_packet_t
 
 extern cvar_t sv_rehlds_movecmd_max_null_streak;
 extern cvar_t sv_rehlds_movecmdtime_min_scale;
+extern cvar_t sv_rehlds_movecmdtime_max_scale;
 extern cvar_t sv_rehlds_movecmdtime_budget_max;
 extern cvar_t sv_rehlds_movecmdtime_speedhack_budget;
 extern cvar_t sv_rehlds_movecmdtime_speedhack_warnings;
@@ -186,6 +200,7 @@ extern cvar_t sv_rehlds_movecmdtime_speedhack_drop;
 static double s_simDropAfterRealtime; // drops past this realtime count as droppedAfter
 
 static client_t s_simClients[MAX_CLIENTS];
+static client_frame_t s_simFrames[64]; // the client's frames, ping_time is its link delay
 static edict_t s_simPlayer;
 static byte s_simLastCmdMsec; // host_client->lastcmd.msec
 
@@ -210,6 +225,7 @@ static void MoveSim_Defaults(movesim_params_t *p)
 	p->levelChangeAt = -1.0;
 	p->frozenAt = -1.0;
 	p->stuckAt = -1.0;
+	p->lagAt = -1.0;
 }
 
 static void MoveSim_RunCmd(byte msec, movesim_result_t *res)
@@ -274,6 +290,36 @@ static double MoveSim_ReleaseDelay(const movesim_params_t *p, int i)
 	return (i / p->releasePerMs) * 0.001;
 }
 
+// arrival time of a packet sent at t through the latency swing
+static double MoveSim_Arrival(const movesim_params_t *p, double t)
+{
+	if (p->lagAt < 0.0 || t < p->lagAt) {
+		return t;
+	}
+	double d = t - p->lagAt;
+	if (d < p->lagUp)
+	{
+		double at = t + p->lagMax * d / p->lagUp;
+
+		// stutter: what was due over a clump arrives in a burst spread
+		// over the first 30% of the next one, then nothing
+		if (p->lagClump > 0.0) {
+			double end = ceil(at / p->lagClump) * p->lagClump;
+			at = end + (at - (end - p->lagClump)) * 0.3;
+		}
+		return at;
+	}
+	d -= p->lagUp;
+	if (d < p->lagHold) {
+		return t + p->lagMax;
+	}
+	d -= p->lagHold;
+	if (d < p->lagDown) {
+		return t + p->lagMax * (1.0 - d / p->lagDown);
+	}
+	return t;
+}
+
 static bool MoveSim_InWindow(double t, double every, double len)
 {
 	return every > 0.0 && len > 0.0 && fmod(t, every) < len;
@@ -288,6 +334,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	qboolean savedPaused = g_psv.paused;
 	float savedNullStreak = sv_rehlds_movecmd_max_null_streak.value;
 	float savedMinScale = sv_rehlds_movecmdtime_min_scale.value;
+	float savedMaxScale = sv_rehlds_movecmdtime_max_scale.value;
 	float savedBudgetMax = sv_rehlds_movecmdtime_budget_max.value;
 	float savedSpeedhackBudget = sv_rehlds_movecmdtime_speedhack_budget.value;
 	float savedSpeedhackWarnings = sv_rehlds_movecmdtime_speedhack_warnings.value;
@@ -300,8 +347,10 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	Q_memset(s_simClients, 0, sizeof(s_simClients));
 	Q_memset(&s_simPlayer, 0, sizeof(s_simPlayer));
 	s_simLastCmdMsec = 0;
+	Q_memset(s_simFrames, 0, sizeof(s_simFrames));
 	s_simClients[0].active = TRUE;
 	s_simClients[0].connected = TRUE;
+	s_simClients[0].frames = s_simFrames;
 	g_psvs.clients = s_simClients;
 	g_psvs.maxclientslimit = MAX_CLIENTS;
 	sv_player = &s_simPlayer;
@@ -317,6 +366,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	s_simDropAfterRealtime = (p->speedLen > 0.0) ? 1000.0 + p->speedAt + p->speedLen + 3.0 : 1.0e12;
 	if (p->minScale > 0.0f) {
 		sv_rehlds_movecmdtime_min_scale.value = p->minScale;
+	}
+	if (p->maxScale > 0.0f) {
+		sv_rehlds_movecmdtime_max_scale.value = p->maxScale;
 	}
 	realtime = 1000.0;
 	g_UserCmdTimeLimiter.ClientConnected(0);
@@ -428,10 +480,15 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 			else {
 				// a released hold arrives in a burst: releasePerMs packets
 				// per server frame, then the current packet
-				for (int i = 0; i < numHeld; i++) {
-					MoveSim_Deliver(p, &held[i], t + MoveSim_ReleaseDelay(p, i), &lastSeq, res, frozen);
+				// the ping the server measures carries the link delay
+				double at = MoveSim_Arrival(p, t);
+				for (int i = 0; i < 64; i++) {
+					s_simFrames[i].ping_time = (float)(at - t + 0.05);
 				}
-				MoveSim_Deliver(p, &pkt, t + MoveSim_ReleaseDelay(p, numHeld), &lastSeq, res, frozen);
+				for (int i = 0; i < numHeld; i++) {
+					MoveSim_Deliver(p, &held[i], at + MoveSim_ReleaseDelay(p, i), &lastSeq, res, frozen);
+				}
+				MoveSim_Deliver(p, &pkt, at + MoveSim_ReleaseDelay(p, numHeld), &lastSeq, res, frozen);
 				numHeld = 0;
 			}
 		}
@@ -448,6 +505,7 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	g_psv.paused = savedPaused;
 	sv_rehlds_movecmd_max_null_streak.value = savedNullStreak;
 	sv_rehlds_movecmdtime_min_scale.value = savedMinScale;
+	sv_rehlds_movecmdtime_max_scale.value = savedMaxScale;
 	sv_rehlds_movecmdtime_budget_max.value = savedBudgetMax;
 	sv_rehlds_movecmdtime_speedhack_budget.value = savedSpeedhackBudget;
 	sv_rehlds_movecmdtime_speedhack_warnings.value = savedSpeedhackWarnings;
@@ -460,10 +518,11 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 static void MoveSim_Check(const char *what, bool cond, const movesim_result_t *res)
 {
 	char msg[512];
-	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u exclGap=%llums lostEst=%llums null=%u frz=%u air=%u/%llums)",
+	Q_snprintf(msg, sizeof(msg), "%s (rate=%.3f win=%.1fs slow=%u speed=%u clamps=%u dropped=%u/%u exclGap=%llums lostEst=%llums late=%llums null=%u frz=%u air=%u/%llums)",
 		what, res->info.rate, res->info.winSec, res->info.detectSlow, res->info.detectSpeed,
 		res->info.budgetClamps, res->dropped, res->judged,
 		(unsigned long long)res->info.exclGapMs, (unsigned long long)res->info.lostEstMs,
+		(unsigned long long)res->info.lateUsedMs,
 		res->info.nullDrops, res->info.frozenCmds,
 		res->info.airstuckCount, (unsigned long long)res->info.airstuckMs);
 	CHECK(msg, cond);
@@ -1134,6 +1193,98 @@ TEST(MoveCmdTimeSlowDrainSweep, MoveCmdTime, 20000)
 			cpps[a], holds[c], intervals[d], losses[b]);
 		MoveSim_Check(what, res.info.rate == 0.0 || (res.info.rate > 0.93 && res.info.rate < 1.07), &res);
 		MoveSim_Check(what, res.info.detectSlow == 0 && res.info.detectSpeed == 0, &res);
+	}
+}
+
+// a latency swing (MAGNUM, 2026-11-01): the link delay grows by a few
+// seconds with stutter silences, stays, then shrinks - the late commands
+// arrive faster than real time. The client never runs ahead of real time,
+// it only catches up: no speedhack verdict
+TEST(MoveCmdTimeLatencySwingSweep, MoveCmdTime, 20000)
+{
+	double ats[] = { 1.0, 30.0 };
+	double maxes[] = { 2.0, 4.0, 6.0 };
+	double ups[] = { 6.0, 10.0, 20.0 };
+	double lagHolds[] = { 0.0, 3.0 };
+	double downs[] = { 5.0, 10.0, 20.0 };
+	double clumps[] = { 0.0, 0.6, 1.0 };
+	int fpss[] = { 60, 150 };
+
+	for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) for (int c = 0; c < 3; c++) for (int g = 0; g < 2; g++)
+	for (int d = 0; d < 3; d++) for (int e = 0; e < 3; e++) for (int f = 0; f < 2; f++)
+	{
+		// the catch-up runs at most 2.5 times real time
+		if (maxes[b] / downs[d] > 0.6) {
+			continue;
+		}
+
+		movesim_params_t p;
+		movesim_result_t res;
+		MoveSim_Defaults(&p);
+		p.seconds = ats[a] + ups[c] + lagHolds[g] + downs[d] + 30.0;
+		p.fps = fpss[f];
+		p.cmdsPerPacket = 2;
+		p.speedhackWarnings = 3;
+		p.maxScale = 1.15f;
+		p.lagAt = ats[a];
+		p.lagMax = maxes[b];
+		p.lagUp = ups[c];
+		p.lagHold = lagHolds[g];
+		p.lagDown = downs[d];
+		p.lagClump = clumps[e];
+		MoveSim_Run(&p, &res);
+
+		char what[160];
+		Q_snprintf(what, sizeof(what), "honest client through a latency swing (at=%.0f lag=%.0fs up=%.0f hold=%.0f down=%.0f clump=%.1f fps=%d)",
+			ats[a], maxes[b], ups[c], lagHolds[g], downs[d], clumps[e], fpss[f]);
+		MoveSim_Check(what, res.info.detectSpeed == 0 && res.info.warnSpeed == 0, &res);
+	}
+}
+
+// a link whose delay keeps growing (a congested uplink): the commands come
+// slower than real time, as from a slowmo client, and the ping grows by the
+// same amount - the telemetry gives the speed back as adj
+TEST(MoveCmdTimePingGrowthTelemetry, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.seconds = 60.0;
+	p.lagAt = 40.0;
+	p.lagUp = 15.0;
+	p.lagMax = 3.0;
+	p.lagHold = 100.0;
+	MoveSim_Run(&p, &res);
+
+	double adj = res.info.rate + res.info.pingDeltaMs / (res.info.winSec * 1000.0);
+	char what[96];
+	Q_snprintf(what, sizeof(what), "ping growth tracked (ping=%d delta=%d adj=%.3f)", res.info.pingMs, res.info.pingDeltaMs, adj);
+	MoveSim_Check(what, res.info.rate < 0.97 && res.info.pingDeltaMs > 2500 && adj > 0.98 && adj < 1.02, &res);
+}
+
+// the late time a silence leaves behind is spent once: a cheater who pauses
+// before a speedhack only delays the verdict
+TEST(MoveCmdTimePauseThenSpeedhack, MoveCmdTime, 5000)
+{
+	double pauses[] = { 0.0, 3.0, 8.0, 30.0 };
+	for (int a = 0; a < 4; a++)
+	{
+		movesim_params_t p;
+		movesim_result_t res;
+		MoveSim_Defaults(&p);
+		p.seconds = 120.0;
+		p.speed = 1.7;
+		p.speedAt = 40.0;
+		p.speedLen = 80.0;
+		if (pauses[a] > 0.0) {
+			p.silenceAt = 35.0 - pauses[a];
+			p.silenceLen = pauses[a];
+		}
+		MoveSim_Run(&p, &res);
+
+		char what[96];
+		Q_snprintf(what, sizeof(what), "speedhack x1.7 after a %.0fs pause is detected", pauses[a]);
+		MoveSim_Check(what, res.info.detectSpeed > 0 && res.info.rate > 1.5, &res);
 	}
 }
 

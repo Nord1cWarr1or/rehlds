@@ -95,6 +95,9 @@ public:
 		uint64_t airstuckMs;       // real time of those spans
 		uint64_t exclGapMs;        // real time kept out of the window: client silence
 		uint64_t lostEstMs;        // client time credited by estimate for lost client commands
+		uint64_t lateUsedMs;       // client time of catch-ups counted against the late reserve
+		int pingMs;                // client ping at the newest rate point
+		int pingDeltaMs;           // ping change over the window (telemetry: link delay growth)
 	};
 	void GetMeasureInfo(unsigned int clientId, measure_info_t *info) const;
 
@@ -117,6 +120,7 @@ private:
 	struct rate_point_t {
 		uint64_t wallMs;   // running wall total at sampling moment
 		uint64_t msecMs;   // running client-time total at sampling moment
+		int pingMs;        // client ping at sampling moment (telemetry)
 	};
 
 	struct usercmd_state_t {
@@ -151,6 +155,9 @@ private:
 		uint64_t exclDebtMs;       // client time still expected for an excluded silence
 		uint64_t exclDebtSinceMs;  // realtime ms the silence debt was last added or paid down
 		uint64_t exclDebtLowMs;    // lowest debt since it was last added (catch-up progress)
+		uint64_t exclDebtGuessMs;  // part of the debt that is a guess, not real time (the first command's backlog)
+		uint64_t lateReserveMs;    // client time expired debts gave up on: a catch-up that comes after all is not speed
+		uint64_t lateReserveSinceMs; // realtime ms the reserve was last added to
 		bool budgetOn;             // the movement budget ran on the previous command
 		bool measureOn;            // the speed measurement ran on the previous command
 		bool cmdsZeroed;           // the engine zeroed the msec of the current packet's commands (FL_FROZEN, paused)
@@ -192,6 +199,7 @@ private:
 		unsigned int lostCmds;          // lost cmds not run at all (net_drop >= 24)
 		uint64_t exclGapMs;             // real time excluded from the window: client silence
 		uint64_t lostEstMs;             // client time credited by estimate for lost commands
+		uint64_t lateUsedMs;            // client time of catch-ups counted against the late reserve
 		uint64_t dumpLostEstMs;         // lostEstMs at the previous state dump
 		double lastDumpTime;
 		double nextDumpTime;
@@ -202,11 +210,13 @@ private:
 	usercmd_state_t m_States[MAX_CLIENTS];
 
 private:
-	void PushRatePoint(usercmd_state_t *ust);
+	void PushRatePoint(usercmd_state_t *ust, int pingMs);
 	void TrackNullSpan(unsigned int clientId, usercmd_state_t *ust, unsigned int msec, uint64_t now);
 	void EndNullSpan(unsigned int clientId, usercmd_state_t *ust);
 	static bool WindowTotals(const usercmd_state_t *ust, uint64_t *dWall, uint64_t *dMsec);
+	static int WindowPingDelta(const usercmd_state_t *ust);
 	static double RecentRate(const usercmd_state_t *ust);
+	static void AbsorbLateTime(usercmd_state_t *ust, uint64_t now);
 	void ApplyBudget(client_t *cl, usercmd_state_t *ust, usercmd_t *ucmd, uint64_t gapMs, bool firstCmd);
 	void ResetMeasure(usercmd_state_t *ust);
 };
