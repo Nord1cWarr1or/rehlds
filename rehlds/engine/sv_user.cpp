@@ -1675,8 +1675,12 @@ void SV_ParseMove(client_t *pSenderClient)
 	// commands lost beyond the backup are replayed from lastcmd (or not run
 	// at all) without passing CUserCmdTimeLimiter::CheckLimits; the moves of
 	// a paused server or a frozen player were zeroed above
+	int newCmdsMsec = 0;
+	for (int i = 0; i < numcmds; i++)
+		newCmdsMsec += cmds[i].msec;
+
 	g_UserCmdTimeLimiter.OnMoveParsed(host_client - g_psvs.clients, net_drop, numbackup, host_client->lastcmd.msec,
-		(g_psv.paused || (sv_player->v.flags & FL_FROZEN)) ? true : false);
+		(g_psv.paused || (sv_player->v.flags & FL_FROZEN)) ? true : false, newCmdsMsec);
 #endif
 
 	SV_EstablishTimeBase(host_client, cmds, net_drop, numbackup, numcmds);

@@ -73,7 +73,7 @@ public:
 	// bookkeeping for the move packet, lastMsec the time of the lastcmd it
 	// replays lost commands with, cmdsZeroed - the engine zeroed the msec of
 	// the packet's commands (FL_FROZEN, paused)
-	void OnMoveParsed(unsigned int clientId, int netDrop, int numBackup, int lastMsec, bool cmdsZeroed);
+	void OnMoveParsed(unsigned int clientId, int netDrop, int numBackup, int lastMsec, bool cmdsZeroed, int newCmdsMsec);
 
 	// telemetry hooks
 	void OnClockWindowSet(unsigned int clientId, double dif);
@@ -95,6 +95,7 @@ public:
 		uint64_t airstuckMs;       // real time of those spans
 		uint64_t exclGapMs;        // real time kept out of the window: client silence
 		uint64_t lostEstMs;        // client time credited by estimate for lost client commands
+		uint64_t lostCutMs;        // estimate of lost commands not run above the wall time, not credited
 		uint64_t lateUsedMs;       // client time of catch-ups counted against the late reserve
 		int pingMs;                // client ping at the newest rate point
 		int pingDeltaMs;           // ping change over the window (telemetry: link delay growth)
@@ -147,6 +148,8 @@ private:
 		uint64_t recentPrevMsecMs;
 		uint64_t pendingDroppedMsec; // time of max_ticks-dropped cmds, added to the window with the next accepted interval
 		uint64_t pendingLostMsec;  // estimated time of lost cmds, added to the window with the next accepted interval
+		uint64_t pendingUnrunMsec; // the part of it the server does not run (net_drop >= 24)
+		uint64_t pendingPacketMsec; // time of the new cmds of the packet that brought it
 
 		// excluded intervals: a long silence is kept out of the window
 		// together with the rest of its frame and the client time that
@@ -158,6 +161,8 @@ private:
 		uint64_t exclDebtGuessMs;  // part of the debt that is a guess, not real time (the first command's backlog)
 		uint64_t lateReserveMs;    // client time expired debts gave up on: a catch-up that comes after all is not speed
 		uint64_t lateReserveSinceMs; // realtime ms the reserve was last added to
+		uint64_t lateBaseWallMs;   // window totals when the reserve was opened: a catch-up is
+		uint64_t lateBaseMsecMs;   // the client time measured beyond the wall time since then
 		bool budgetOn;             // the movement budget ran on the previous command
 		bool measureOn;            // the speed measurement ran on the previous command
 		bool cmdsZeroed;           // the engine zeroed the msec of the current packet's commands (FL_FROZEN, paused)
@@ -199,6 +204,7 @@ private:
 		unsigned int lostCmds;          // lost cmds not run at all (net_drop >= 24)
 		uint64_t exclGapMs;             // real time excluded from the window: client silence
 		uint64_t lostEstMs;             // client time credited by estimate for lost commands
+		uint64_t lostCutMs;             // estimate of lost commands not run above the wall time, not credited
 		uint64_t lateUsedMs;            // client time of catch-ups counted against the late reserve
 		uint64_t dumpLostEstMs;         // lostEstMs at the previous state dump
 		double lastDumpTime;

@@ -649,6 +649,10 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 		// reserve - a catch-up beyond real time is counted against it, not
 		// as speed. It is time the client has not played, spent once.
 		if (ust->exclDebtMs > ust->exclDebtGuessMs) {
+			if (ust->lateReserveMs == 0) {
+				ust->lateBaseWallMs = ust->rateWallMs;
+				ust->lateBaseMsecMs = ust->rateMsecMs;
+			}
 			uint64_t reserve = ust->lateReserveMs + (ust->exclDebtMs - ust->exclDebtGuessMs);
 			ust->lateReserveMs = (reserve > RATE_LATE_RESERVE_MAX_MS) ? RATE_LATE_RESERVE_MAX_MS : reserve;
 			ust->lateReserveSinceMs = now;
@@ -718,9 +722,33 @@ bool CUserCmdTimeLimiter::CheckLimits(unsigned int clientId, usercmd_t *ucmd)
 	// client time of the interval: this command, commands max_ticks
 	// dropped and lost commands credited by estimate
 	uint64_t delivered = ucmd->msec + ust->pendingDroppedMsec + ust->pendingLostMsec;
+
+	// The commands lost in a gap the server does not run are estimated by
+	// the client's average command time, and one long frame (a hitch while
+	// the link drops most packets) lifts that average for thousands of
+	// short ones. They were played within the wall time of the interval,
+	// together with the commands of the packet that brought them: above it
+	// the estimate is not credited. Time the server never runs gives a
+	// cheater no movement, so nothing is hidden by the cut.
+	if (intervalValid && ust->pendingUnrunMsec > 0) {
+		uint64_t known = delivered - ust->pendingUnrunMsec;
+		if (ust->pendingPacketMsec > ucmd->msec) {
+			known += ust->pendingPacketMsec - ucmd->msec;
+		}
+		uint64_t room = (gapMs > known) ? (gapMs - known) : 0;
+		if (ust->pendingUnrunMsec > room) {
+			uint64_t cut = ust->pendingUnrunMsec - room;
+			delivered -= cut;
+			ust->pendingLostMsec -= cut;
+			ust->lostCutMs += cut;
+		}
+	}
+
 	ust->lostEstMs += ust->pendingLostMsec;
 	ust->pendingDroppedMsec = 0;
 	ust->pendingLostMsec = 0;
+	ust->pendingUnrunMsec = 0;
+	ust->pendingPacketMsec = 0;
 
 	if (intervalValid) {
 		ust->rateWallMs += gapMs;
@@ -1096,7 +1124,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 
 	// clockRate drifts permanently after speedhack sessions (reported msec
 	// cannot be unreported) - rate above is the live metric
-	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u est:%.0fs) excl=(g:%.0fs late:%.1fs) air=(n:%u t:%.0fs) frz=%u ping=(%d d:%+d adj:%.2f) msec=%llums age=%.0fs",
+	MCmd_Log("STATE name=%s rate=%.2f winSec=%.0f clockRate=%.2f perMsec=%.1f fps~%.0f loss=%u twarn=(s:%u m:%u) drops=(t:%u n:%u i:%u a:%u/%u) bcl=%u sskip=%u cw=%u skipped=%u restarts=%u lost=(r:%u l:%u est:%.0fs cut:%.1fs) excl=(g:%.0fs late:%.1fs) air=(n:%u t:%.0fs) frz=%u ping=(%d d:%+d adj:%.2f) msec=%llums age=%.0fs",
 		cl->name,
 		info.rate, info.winSec, clockRate,
 		ust->avgMsec,
@@ -1109,7 +1137,7 @@ void CUserCmdTimeLimiter::DumpClientState(unsigned int clientId)
 		ust->stallImmuneSkipped,
 		ust->cwCount, ust->cwSkippedTotal,
 		ust->rateRestarts,
-		ust->replayedCmds, ust->lostCmds, ust->lostEstMs / 1000.0,
+		ust->replayedCmds, ust->lostCmds, ust->lostEstMs / 1000.0, ust->lostCutMs / 1000.0,
 		ust->exclGapMs / 1000.0, ust->lateUsedMs / 1000.0,
 		ust->airstuckCount, ust->airstuckMs / 1000.0,
 		ust->frozenCmds,
@@ -1167,21 +1195,27 @@ void CUserCmdTimeLimiter::ResetMeasure(usercmd_state_t *ust)
 	ust->recentPrevMsecMs = 0;
 	ust->pendingDroppedMsec = 0;
 	ust->pendingLostMsec = 0;
+	ust->pendingUnrunMsec = 0;
+	ust->pendingPacketMsec = 0;
 	ust->exclDebtMs = 0;
 	ust->exclDebtLowMs = 0;
 	ust->exclDebtSinceMs = 0;
 	ust->exclDebtGuessMs = 0;
 	ust->lateReserveMs = 0;
 	ust->lateReserveSinceMs = 0;
+	ust->lateBaseWallMs = 0;
+	ust->lateBaseMsecMs = 0;
 	ust->exclFrameMs = 0;
 	ust->lastDetectMs = 0;
 	ust->stableSinceMs = 0;
 }
 
 // A catch-up of time an expired debt gave up on: the client time measured
-// since the latest recent-speed snapshot beyond its wall time is taken out
-// of the window while the late reserve lasts. The take never goes below a
-// stored rate point, so the window stays monotonic.
+// since the reserve was opened beyond its wall time is taken out of the
+// window while the late reserve lasts. It is the net excess, not one of
+// each second: a jittery link brings some seconds early and others late,
+// and only the early ones taken would tilt the window towards slowmo. The
+// take never goes below a stored rate point, so the window stays monotonic.
 void CUserCmdTimeLimiter::AbsorbLateTime(usercmd_state_t *ust, uint64_t now)
 {
 	if (ust->lateReserveMs == 0) {
@@ -1192,8 +1226,8 @@ void CUserCmdTimeLimiter::AbsorbLateTime(usercmd_state_t *ust, uint64_t now)
 		return;
 	}
 
-	uint64_t dWall = ust->rateWallMs - ust->recentWallMs;
-	uint64_t dMsec = ust->rateMsecMs - ust->recentMsecMs;
+	uint64_t dWall = ust->rateWallMs - ust->lateBaseWallMs;
+	uint64_t dMsec = ust->rateMsecMs - ust->lateBaseMsecMs;
 	if (dMsec <= dWall) {
 		return;
 	}
@@ -1275,6 +1309,7 @@ void CUserCmdTimeLimiter::GetMeasureInfo(unsigned int clientId, measure_info_t *
 	info->airstuckMs = ust->airstuckMs;
 	info->exclGapMs = ust->exclGapMs;
 	info->lostEstMs = ust->lostEstMs;
+	info->lostCutMs = ust->lostCutMs;
 	info->lateUsedMs = ust->lateUsedMs;
 }
 
@@ -1312,7 +1347,7 @@ void CUserCmdTimeLimiter::OnCmdSkippedByClockWindow(unsigned int clientId)
 	EndNullSpan(clientId, ust);
 }
 
-void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int numBackup, int lastMsec, bool cmdsZeroed)
+void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int numBackup, int lastMsec, bool cmdsZeroed, int newCmdsMsec)
 {
 	usercmd_state_t *ust = &m_States[clientId];
 
@@ -1338,7 +1373,12 @@ void CUserCmdTimeLimiter::OnMoveParsed(unsigned int clientId, int netDrop, int n
 
 	unsigned int missing = (unsigned int)(netDrop - numBackup);
 	double estMsec = (netDrop < 24) ? (double)lastMsec : ust->avgMsec;
-	ust->pendingLostMsec += (uint64_t)(missing * estMsec + 0.5);
+	uint64_t estMs = (uint64_t)(missing * estMsec + 0.5);
+	ust->pendingLostMsec += estMs;
+	if (netDrop >= 24) {
+		ust->pendingUnrunMsec += estMs;
+		ust->pendingPacketMsec = (uint64_t)newCmdsMsec;
+	}
 
 	// air-stuck span: the replayed commands carry the time of lastcmd (none
 	// for a stuck client, faked loss included); with nothing run the time of

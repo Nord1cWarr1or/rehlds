@@ -86,6 +86,11 @@ struct movesim_params_t
 	// network outage: every outageEvery seconds packets are lost for outageLen
 	double outageEvery;
 	double outageLen;
+	double outageUntil;        // > 0: the outages stop at this time
+
+	// link jitter: every packet is delayed by a random 0..jitterMs, the
+	// packets keep their order
+	double jitterMs;
 
 	// hold (fakelag/choke): every holdEvery seconds packets are held for
 	// holdLen, then released releasePerMs packets per server frame
@@ -114,6 +119,12 @@ struct movesim_params_t
 	// capped at 250ms like Host_FilterTime does
 	double hitchAt;
 	double hitchLen;
+	double hitchEvery;         // > 0: the hitch repeats this often until hitchUntil
+	double hitchUntil;
+
+	// with lossTo > 0 the random packet loss applies only from lossFrom to lossTo
+	double lossFrom;
+	double lossTo;
 
 	// level change: the client is inactive, its signon packets carry no
 	// moves but take sequence numbers the server's netchan does see
@@ -265,7 +276,11 @@ static void MoveSim_Deliver(const movesim_params_t *p, const movesim_packet_t *p
 		netDrop = 0;
 	}
 
-	g_UserCmdTimeLimiter.OnMoveParsed(0, netDrop, p->numBackup, s_simLastCmdMsec, frozen);
+	int newCmdsMsec = 0;
+	for (int i = 0; i < pkt->numCmds; i++) {
+		newCmdsMsec += frozen ? 0 : pkt->msec[i];
+	}
+	g_UserCmdTimeLimiter.OnMoveParsed(0, netDrop, p->numBackup, s_simLastCmdMsec, frozen, newCmdsMsec);
 
 	if (netDrop > 0 && netDrop < 24) {
 		int backups = (netDrop < p->numBackup) ? netDrop : p->numBackup;
@@ -378,6 +393,8 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 	movesim_packet_t pkt;
 	byte prev[2] = { 0, 0 };
 	unsigned int lcg = 12345;
+	unsigned int jitterLcg = 777;
+	double lastArrival = 0.0;
 	double frameSec = 1.0 / p->fps;
 	double msecCarry = 0.0;
 	int seq = 0;
@@ -424,7 +441,9 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 			continue;
 		}
 
-		if (p->hitchAt >= 0.0 && t >= p->hitchAt && t < p->hitchAt + p->hitchLen) {
+		bool hitch = p->hitchAt >= 0.0 && t >= p->hitchAt
+			&& ((p->hitchEvery > 0.0) ? (t < p->hitchUntil && fmod(t - p->hitchAt, p->hitchEvery) < p->hitchLen) : (t < p->hitchAt + p->hitchLen));
+		if (hitch) {
 			inHitch = true;
 			continue;
 		}
@@ -464,8 +483,8 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 		prev[1] = pkt.msec[pkt.numCmds - 1];
 
 		lcg = lcg * 1103515245 + 12345;
-		bool lost = ((lcg >> 16) % 1000) < p->lossPermille
-			|| MoveSim_InWindow(t, p->outageEvery, p->outageLen);
+		bool lost = (((lcg >> 16) % 1000) < p->lossPermille && (p->lossTo <= 0.0 || (t >= p->lossFrom && t < p->lossTo)))
+			|| ((p->outageUntil <= 0.0 || t < p->outageUntil) && MoveSim_InWindow(t, p->outageEvery, p->outageLen));
 		bool frozen = (p->frozenEvery > 0.0)
 			? MoveSim_InWindow(t, p->frozenEvery, p->frozenLen)
 			: (p->frozenAt >= 0.0 && t >= p->frozenAt && t < p->frozenAt + p->frozenLen);
@@ -482,6 +501,14 @@ static void MoveSim_Run(const movesim_params_t *p, movesim_result_t *res)
 				// per server frame, then the current packet
 				// the ping the server measures carries the link delay
 				double at = MoveSim_Arrival(p, t);
+				if (p->jitterMs > 0.0) {
+					jitterLcg = jitterLcg * 1103515245 + 12345;
+					at += ((jitterLcg >> 16) % 1000) * p->jitterMs * 0.000001;
+					if (at < lastArrival) {
+						at = lastArrival;
+					}
+					lastArrival = at;
+				}
 				for (int i = 0; i < 64; i++) {
 					s_simFrames[i].ping_time = (float)(at - t + 0.05);
 				}
@@ -1260,6 +1287,88 @@ TEST(MoveCmdTimePingGrowthTelemetry, MoveCmdTime, 5000)
 	char what[96];
 	Q_snprintf(what, sizeof(what), "ping growth tracked (ping=%d delta=%d adj=%.3f)", res.info.pingMs, res.info.pingDeltaMs, adj);
 	MoveSim_Check(what, res.info.rate < 0.97 && res.info.pingDeltaMs > 2500 && adj > 0.98 && adj < 1.02, &res);
+}
+
+// a link that lost a run of packets (aim trevoga, 2026-11-06): the outages
+// and a hitch leave a late reserve behind, then the link only jitters. A jitter is no
+// catch-up: the commands that come early after a late second belong to it,
+// the reserve must not take them out of the window
+TEST(MoveCmdTimeLossThenJitter, MoveCmdTime, 5000)
+{
+	double jitters[] = { 30.0, 80.0, 150.0 };
+	int fpss[] = { 60, 130 };
+	for (int a = 0; a < 3; a++) for (int f = 0; f < 2; f++)
+	{
+		movesim_params_t p;
+		movesim_result_t res;
+		MoveSim_Defaults(&p);
+		p.seconds = 70.0;
+		p.fps = fpss[f];
+		p.cmdsPerPacket = 2;
+		p.outageEvery = 3.0;
+		p.outageLen = 0.8;
+		p.outageUntil = 30.0;
+		p.hitchAt = 26.0;
+		p.hitchLen = 4.0;
+		p.jitterMs = jitters[a];
+		MoveSim_Run(&p, &res);
+
+		char what[128];
+		Q_snprintf(what, sizeof(what), "jitter %.0fms after packet loss is real speed (fps=%d)", jitters[a], fpss[f]);
+		MoveSim_Check(what, res.info.rate > 0.97 && res.info.rate < 1.03, &res);
+	}
+}
+
+// a link that drops most packets while the client hitches (gGusak,
+// 2026-11-10): the commands lost in gaps the server does not run are
+// estimated by an average that the long frames lift. No speedhack verdict
+TEST(MoveCmdTimeLossWithHitches, MoveCmdTime, 20000)
+{
+	int fpss[] = { 100, 300, 900 };
+	unsigned int losses[] = { 800, 900, 950 };
+	double hitchEverys[] = { 0.5, 2.0 };
+	for (int f = 0; f < 3; f++) for (int l = 0; l < 3; l++) for (int h = 0; h < 2; h++)
+	{
+		movesim_params_t p;
+		movesim_result_t res;
+		MoveSim_Defaults(&p);
+		p.seconds = 80.0;
+		p.fps = fpss[f];
+		p.cmdsPerPacket = fpss[f] / 100;
+		p.speedhackWarnings = 3;
+		p.maxScale = 1.15f;
+		p.lossPermille = losses[l];
+		p.lossFrom = 50.0;
+		p.lossTo = 70.0;
+		p.hitchAt = 50.0;
+		p.hitchLen = 0.3;
+		p.hitchEvery = hitchEverys[h];
+		p.hitchUntil = 70.0;
+		MoveSim_Run(&p, &res);
+
+		char what[128];
+		Q_snprintf(what, sizeof(what), "heavy loss with hitches is no speedhack (fps=%d loss=%u hitch every %.1fs)", fpss[f], losses[l], hitchEverys[h]);
+		MoveSim_Check(what, res.info.detectSpeed == 0 && res.info.warnSpeed == 0 && res.info.rate < 1.06, &res);
+	}
+}
+
+// sequence numbers that jump with no commands behind them: the server runs
+// nothing for such a gap, its estimate is not credited above the wall time
+TEST(MoveCmdTimePhantomLoss, MoveCmdTime, 5000)
+{
+	movesim_params_t p;
+	movesim_result_t res;
+	MoveSim_Defaults(&p);
+	p.fakeSkip = 40;
+	MoveSim_Run(&p, &res);
+	MoveSim_Check("phantom loss adds no client time", res.info.rate > 0.97 && res.info.rate < 1.03 && res.info.detectSpeed == 0 && res.info.lostCutMs > 0, &res);
+
+	// the commands the server does run still show the speed
+	MoveSim_Defaults(&p);
+	p.speed = 1.5;
+	p.fakeSkip = 40;
+	MoveSim_Run(&p, &res);
+	MoveSim_Check("speedhack x1.5 behind phantom loss is detected", res.info.rate > 1.4 && res.info.detectSpeed > 0, &res);
 }
 
 // the late time a silence leaves behind is spent once: a cheater who pauses
