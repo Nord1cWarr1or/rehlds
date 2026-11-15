@@ -266,6 +266,7 @@ cvar_t sv_rehlds_maxclients_from_single_ip = { "sv_rehlds_maxclients_from_single
 cvar_t sv_use_entity_file = { "sv_use_entity_file", "0", 0, 0.0f, nullptr };
 cvar_t sv_usercmd_custom_random_seed = { "sv_usercmd_custom_random_seed", "0", 0, 0.0f, nullptr };
 cvar_t sv_rehlds_allow_large_sprays = { "sv_rehlds_allow_large_sprays", "1", 0, 1.0f, nullptr };
+cvar_t sv_rehlds_resident_models = { "sv_rehlds_resident_models", "0", 0, 0.0f, nullptr };
 #endif
 
 delta_t *SV_LookupDelta(char *name)
@@ -8622,6 +8623,7 @@ void SV_Init(void)
 	Cvar_RegisterVariable(&sv_use_entity_file);
 	Cvar_RegisterVariable(&sv_usercmd_custom_random_seed);
 	Cvar_RegisterVariable(&sv_rehlds_allow_large_sprays);
+	Cvar_RegisterVariable(&sv_rehlds_resident_models);
 #endif
 
 	//------------------------------------------------

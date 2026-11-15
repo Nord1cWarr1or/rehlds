@@ -51,6 +51,12 @@ void EXT_FUNC Mod_LoadStudioModel_internal(model_t * mod, void * buffer)
 
 	mod->type = mod_studio;
 	mod->flags = phdr->flags;
+#ifdef REHLDS_FIXES
+	// With sv_rehlds_resident_models the model data is kept out of the evictable cache.
+	// Otherwise every access of a model that did not fit into the cache (the hunk is small
+	// by default) reloads the whole file from the disk, e.g. with a per-player modelindex.
+	if (!Mod_AllocResidentStudio(mod, phdr->length + 1280 * phdr->numtextures, Mod_ResidentStudioBudget()))
+#endif
 	Cache_Alloc(&mod->cache, phdr->length + 1280 * phdr->numtextures, mod->name);
 	pout = (uint8 *)mod->cache.data;
 	if (pout)

@@ -56,10 +56,24 @@ extern int ad_enabled;
 extern cachewad_t ad_wad;
 extern mod_known_info_t mod_known_info[MAX_KNOWN_MODELS];
 
+#ifdef REHLDS_FIXES
+// values for model_t's needload (shared with the unit tests)
+enum
+{
+	NL_PRESENT = 0,
+	NL_NEEDS_LOADED,
+	NL_UNREFERENCED
+};
+#endif // REHLDS_FIXES
+
 void SW_Mod_Init(void);
 void *Mod_Extradata(model_t *mod);
 mleaf_t *Mod_PointInLeaf(vec_t *p, model_t *model);
 void Mod_ClearAll(void);
+#ifdef REHLDS_FIXES
+int Mod_ResidentStudioBudget(void);
+bool Mod_AllocResidentStudio(model_t *mod, int size, int budget);
+#endif
 void Mod_FillInCRCInfo(qboolean trackCRC, int model_number);
 model_t *Mod_FindName(qboolean trackCRC, const char *name);
 NOXREF qboolean Mod_ValidateCRC(const char *name, CRC32_t crc);

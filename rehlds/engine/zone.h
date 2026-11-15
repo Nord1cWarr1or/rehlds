@@ -85,6 +85,13 @@ void Cache_Free(cache_user_t *c);
 NOXREF int Cache_TotalUsed();
 void *Cache_Check(cache_user_t *c);
 void *Cache_Alloc(cache_user_t *c, int size, char *name);
+#ifdef REHLDS_FIXES
+bool Cache_IsResident(const cache_user_t *c);
+int Cache_ResidentUsed();
+int Cache_ResidentCost(int size);
+int Cache_ResidentSize(const cache_user_t *c);
+void *Cache_AllocResident(cache_user_t *c, int size, const char *name, int budget);
+#endif
 void Memory_Init(void *buf, int size);
 NOXREF void Cache_Print_Models_And_Totals();
 NOXREF void Cache_Print_Sounds_And_Totals();

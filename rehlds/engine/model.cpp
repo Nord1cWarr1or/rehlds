@@ -39,6 +39,7 @@ int ad_enabled;
 cachewad_t ad_wad;
 mod_known_info_t mod_known_info[MAX_KNOWN_MODELS];
 
+#ifndef REHLDS_FIXES
 // values for model_t's needload
 enum
 {
@@ -46,6 +47,7 @@ enum
 	NL_NEEDS_LOADED,
 	NL_UNREFERENCED
 };
+#endif // REHLDS_FIXES
 
 void SW_Mod_Init(void)
 {
@@ -125,6 +127,95 @@ void Mod_ClearAll(void)
 	}
 }
 
+#ifdef REHLDS_FIXES
+// Budget of sv_rehlds_resident_models in bytes, 0 when it is disabled.
+int Mod_ResidentStudioBudget(void)
+{
+	float megabytes = sv_rehlds_resident_models.value;
+	if (!(megabytes > 0.0f)) // also rejects NaN
+	{
+		return 0;
+	}
+
+	if (megabytes > 2047.0f)
+	{
+		megabytes = 2047.0f;
+	}
+
+	return (int)(megabytes * 1024.0f * 1024.0f);
+}
+
+// A resident studio model that the current map does not reference (it was loaded for a previous map).
+// Note: while a map is being precached, its models that are not precached yet are unreferenced too,
+// so a model that the new map needs can be freed here and loaded again a moment later.
+static bool Mod_IsStaleResident(const model_t *mod)
+{
+	return mod->type == mod_studio && mod->needload == NL_UNREFERENCED && Cache_IsResident(&mod->cache);
+}
+
+static int Mod_StaleResidentSize(void)
+{
+	int total = 0;
+	const model_t *mod = mod_known;
+	for (int i = 0; i < mod_numknown; i++, mod++)
+	{
+		if (Mod_IsStaleResident(mod))
+		{
+			total += Cache_ResidentSize(&mod->cache);
+		}
+	}
+
+	return total;
+}
+
+// Frees one stale resident studio model. Returns false when there is nothing to free.
+static bool Mod_FreeStaleResident(void)
+{
+	model_t *mod = mod_known;
+	for (int i = 0; i < mod_numknown; i++, mod++)
+	{
+		if (Mod_IsStaleResident(mod))
+		{
+			Cache_Free(&mod->cache);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// Places `size` bytes of the studio model data outside of the evictable cache when `budget` allows it,
+// freeing the stale resident models if that makes the model fit. When the model cannot fit even then,
+// nothing is freed and false is returned: the caller falls back to Cache_Alloc.
+bool Mod_AllocResidentStudio(model_t *mod, int size, int budget)
+{
+	if (budget <= 0)
+	{
+		return false;
+	}
+
+	// The budget can be smaller than the usage if the cvar was lowered, then `needed` covers the excess too.
+	// It also exceeds the stale total whenever the model alone is larger than the budget.
+	const int needed = Cache_ResidentCost(size) - (budget - Cache_ResidentUsed());
+	if (needed > 0 && Mod_StaleResidentSize() < needed)
+	{
+		Con_DPrintf("%s: %s (%i bytes) does not fit into sv_rehlds_resident_models (%i of %i bytes used), it goes to the cache\n",
+			__func__, mod->name, size, Cache_ResidentUsed(), budget);
+		return false;
+	}
+
+	while (!Cache_AllocResident(&mod->cache, size, mod->name, budget))
+	{
+		if (!Mod_FreeStaleResident())
+		{
+			return false; // out of heap memory
+		}
+	}
+
+	return true;
+}
+#endif // REHLDS_FIXES
+
 void Mod_FillInCRCInfo(qboolean trackCRC, int model_number)
 {
 	mod_known_info_t *p;
@@ -169,6 +260,15 @@ model_t *Mod_FindName(qboolean trackCRC, const char *name)
 			if (!avail)
 				Sys_Error("%s: mod_numknown >= MAX_KNOWN_MODELS", __func__);
 			mod = avail;
+#ifdef REHLDS_FIXES
+			// The slot is taken over by another name: drop the data of the previous model,
+			// otherwise Mod_LoadModel finds it via Cache_Check and serves it as the new model
+			// (and resident data would never be freed at all).
+			if ((mod->type == mod_alias || mod->type == mod_studio) && mod->cache.data)
+			{
+				Cache_Free(&mod->cache);
+			}
+#endif
 			Mod_FillInCRCInfo(trackCRC, avail - mod_known);
 		}
 		Q_strncpy(mod->name, name, 63);
@@ -1895,8 +1995,17 @@ void Mod_Print(void)
 			Con_Printf(" (!R)");
 		if (mod->needload & NL_NEEDS_LOADED)
 			Con_Printf(" (!P)");
+#ifdef REHLDS_FIXES
+		if (mod->type == mod_studio && Cache_IsResident(&mod->cache))
+			Con_Printf(" (resident)");
+#endif
 		Con_Printf("\n");
 	}
+
+#ifdef REHLDS_FIXES
+	Con_Printf("Resident studio models: %.2f of %.2f MB (sv_rehlds_resident_models)\n",
+		Cache_ResidentUsed() / (1024.0f * 1024.0f), Mod_ResidentStudioBudget() / (1024.0f * 1024.0f));
+#endif
 }
 
 NOXREF void Mod_ChangeGame(void)

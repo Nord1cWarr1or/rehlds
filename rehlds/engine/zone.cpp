@@ -518,6 +518,80 @@ typedef struct cache_system_s
 
 cache_system_t cache_head;
 
+#ifdef REHLDS_FIXES
+// Resident entries are allocated on the heap, never evicted by the LRU and are not
+// placed in the hunk. They are marked by pointing next/prev at themselves, which
+// never happens for an entry that is linked into the cache.
+static int g_cacheResidentUsed = 0;
+
+static inline bool Cache_IsResidentEntry(const cache_system_t *cs)
+{
+	return cs->next == cs && cs->prev == cs;
+}
+
+bool Cache_IsResident(const cache_user_t *c)
+{
+	return c->data && Cache_IsResidentEntry((const cache_system_t *)c->data - 1);
+}
+
+int Cache_ResidentUsed()
+{
+	return g_cacheResidentUsed;
+}
+
+// How much of the budget a resident entry with `size` bytes of data takes.
+int Cache_ResidentCost(int size)
+{
+	return size + (int)sizeof(cache_system_t);
+}
+
+// How much of the budget the resident entry of `c` takes, 0 when `c` is not resident.
+int Cache_ResidentSize(const cache_user_t *c)
+{
+	return Cache_IsResident(c) ? ((const cache_system_t *)c->data - 1)->size : 0;
+}
+
+// Allocates `size` bytes outside of the evictable cache as long as the resident
+// total stays within `budget` bytes. Returns nullptr (and leaves `c` untouched)
+// when the budget does not allow it; the caller is expected to use Cache_Alloc then.
+void *Cache_AllocResident(cache_user_t *c, int size, const char *name, int budget)
+{
+	if (c->data)
+	{
+		Sys_Error("%s: already allocated", __func__);
+	}
+
+	if (size <= 0)
+	{
+		Sys_Error("%s: size %i", __func__, size);
+	}
+
+	const int total = Cache_ResidentCost(size);
+	if (budget <= 0 || total > budget - g_cacheResidentUsed)
+	{
+		return nullptr;
+	}
+
+	cache_system_t *cs = (cache_system_t *)Mem_Malloc(total);
+	if (!cs)
+	{
+		return nullptr;
+	}
+
+	Q_memset(cs, 0, sizeof(cache_system_t));
+	cs->size = total;
+	cs->user = c;
+	cs->next = cs->prev = cs;
+	Q_strncpy(cs->name, name, CACHE_NAME_LEN - 1);
+	cs->name[CACHE_NAME_LEN - 1] = 0;
+
+	c->data = cs + 1;
+	g_cacheResidentUsed += total;
+
+	return c->data;
+}
+#endif // REHLDS_FIXES
+
 void Cache_Move(cache_system_t *c)
 {
 	cache_system_t *newmem = Cache_TryAlloc(c->size, 1);
@@ -794,6 +868,16 @@ void Cache_Free(cache_user_t *c)
 
 	cache_system_t *cs = ((cache_system_t *)c->data - 1);
 
+#ifdef REHLDS_FIXES
+	if (Cache_IsResidentEntry(cs))
+	{
+		g_cacheResidentUsed -= cs->size;
+		c->data = nullptr;
+		Mem_Free(cs);
+		return;
+	}
+#endif
+
 	cs->prev->next = cs->next;
 	cs->next->prev = cs->prev;
 	c->data = cs->prev = cs->next = 0;
@@ -820,6 +904,13 @@ void* EXT_FUNC Cache_Check(cache_user_t *c)
 	if (c->data)
 	{
 		cs = (cache_system_t *)((char *)c->data - sizeof(cache_system_t));
+
+#ifdef REHLDS_FIXES
+		if (Cache_IsResidentEntry(cs))
+		{
+			return c->data;
+		}
+#endif
 
 		Cache_UnlinkLRU((cache_system_t *)c->data - 1);
 		Cache_MakeLRU(cs);

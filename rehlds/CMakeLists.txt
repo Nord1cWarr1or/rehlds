@@ -193,6 +193,7 @@ set(UNITTESTS_SRCS
 	unittests/delta_tests.cpp
 	unittests/download_tests.cpp
 	unittests/info_tests.cpp
+	unittests/model_tests.cpp
 	unittests/mathlib_tests.cpp
 	unittests/messagemngr_tests.cpp
 	unittests/rehlds_tests_shared.cpp
@@ -202,6 +203,7 @@ set(UNITTESTS_SRCS
 	unittests/TestRunner.cpp
 	unittests/tmessage_tests.cpp
 	unittests/unicode_tests.cpp
+	unittests/zone_tests.cpp
 )
 
 set(COMMON_SRCS

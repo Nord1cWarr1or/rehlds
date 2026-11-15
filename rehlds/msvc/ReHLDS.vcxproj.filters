@@ -305,6 +305,12 @@
     <ClCompile Include="..\unittests\unicode_tests.cpp">
       <Filter>unittests</Filter>
     </ClCompile>
+    <ClCompile Include="..\unittests\zone_tests.cpp">
+      <Filter>unittests</Filter>
+    </ClCompile>
+    <ClCompile Include="..\unittests\model_tests.cpp">
+      <Filter>unittests</Filter>
+    </ClCompile>
     <ClCompile Include="..\unittests\info_tests.cpp">
       <Filter>unittests</Filter>
     </ClCompile>
