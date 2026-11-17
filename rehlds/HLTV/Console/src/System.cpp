@@ -349,6 +349,7 @@ System::LocalCommandID_s System::m_LocalCmdReg[] = {
 	{ "title",         CMD_ID_TITLE,         &System::CMD_Title },
 	{ "showcon",       CMD_ID_SHOWCON,       &System::CMD_ShowCon },
 	{ "echo",          CMD_ID_ECHO,          &System::CMD_Echo },
+	{ "version",       CMD_ID_VERSION,       &System::CMD_Version },
 };
 
 bool System::Init(IBaseSystem *system, int serial, char *name)
@@ -669,7 +670,14 @@ void System::CMD_Title(char *cmdLine)
 		return;
 	}
 
-	m_Console.SetTitle(params.GetToken(1));
+	SetTitle(params.GetToken(1));
+}
+
+void System::CMD_Version(char *cmdLine)
+{
+	Printf("ReHLTV version: " APP_VERSION "\n");
+	Printf("Build date: " __TIME__ " " __DATE__ "\n");
+	Printf("Build from: " APP_COMMIT_URL APP_COMMIT_SHA "\n");
 }
 
 void System::CMD_Echo(char *cmdLine)
@@ -1010,7 +1018,10 @@ void System::ExecuteCommand(int commandID, char *commandLine)
 
 void System::SetTitle(char *text)
 {
-	m_Console.SetTitle(text);
+	// "[ReHLTV <version>] <title>", like the "[ReHLDS <version>]" title of the hlds console window
+	char buffer[256];
+	Q_snprintf(buffer, sizeof(buffer), "[ReHLTV " APP_VERSION "] %s", text ? text : "");
+	m_Console.SetTitle(buffer);
 }
 
 bool System::InitVGUI(IVGuiModule *module)
@@ -1098,11 +1109,44 @@ unsigned char *System::LoadFile(const char *name, int *length)
 
 #ifdef _WIN32
 
+#ifdef HLTV_FIXES
+// Load steamclient.dll from the hltv.exe folder before the proxy initializes Steam.
+// Without this, steam_api may take the steamclient.dll of an installed Steam client from
+// HKCU\Software\Valve\Steam\ActiveProcess\SteamClientDll (the value stays there after Steam exits),
+// and the proxy randomly fails to initialize Steam. Same as Sys_PreloadSteamClient() in hlds.exe.
+// Disable with -nolocalsteamclient.
+static void PreloadSteamClient(const char *cmdLine)
+{
+	if (cmdLine && strstr(cmdLine, "-nolocalsteamclient"))
+		return;
+
+	char path[MAX_PATH];
+	DWORD len = GetModuleFileNameA(nullptr, path, sizeof(path));
+	if (len == 0 || len >= sizeof(path))
+		return;
+
+	char *slash = strrchr(path, '\\');
+	if (!slash)
+		return;
+
+	const char steamClient[] = "steamclient.dll";
+	if ((size_t)(slash + 1 - path) + sizeof(steamClient) > sizeof(path))
+		return;
+
+	strcpy(slash + 1, steamClient);
+	if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+		return; // no local steamclient.dll, leave the choice to steam_api
+
+	LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+#endif // HLTV_FIXES
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd)
 {
 #ifdef HLTV_FIXES
 	return CatchAndWriteMiniDump([=]()
 	{
+		PreloadSteamClient(lpCmdLine);
 #endif
 		gSystem.BuildCommandLine(lpCmdLine);
 		return gSystem.Run();
