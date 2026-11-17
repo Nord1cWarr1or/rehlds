@@ -105,7 +105,10 @@ enum
 };
 
 // Flow control bytes per second limits
-const float MAX_RATE		= 100000.0f;
+// Highest rate that can still throttle a client: the largest packet the netchan accounts for
+// (MAX_UDP_PACKET 4010 + UDP_HEADER_SIZE 28 = 4038 bytes) sent at the stock client's maximum
+// cl_updaterate of 102 packets/s: 4038 * 102 = 411876. Anything above never delays a packet.
+const float MAX_RATE		= 411876.0f;
 const float MIN_RATE		= 1000.0f;
 
 // Default data rate
