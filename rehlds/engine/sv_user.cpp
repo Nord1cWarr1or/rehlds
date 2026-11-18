@@ -933,6 +933,12 @@ void SV_RunCmd(usercmd_t* ucmd, int random_seed, qboolean fNetCmd, qboolean fCho
 	if (host_client->ignorecmdtime > realtime)
 	{
 		host_client->cmdtime = (double)ucmd->msec / 1000.0 + host_client->cmdtime;
+#ifdef REHLDS_FIXES
+		// telemetry: this command is skipped by the vanilla clockwindow
+		// mechanism BEFORE CUserCmdTimeLimiter::CheckLimits sees it, so its
+		// msec never reaches the drift detector
+		g_UserCmdTimeLimiter.OnCmdSkippedByClockWindow(host_client - g_psvs.clients);
+#endif
 		return;
 	}
 
@@ -1664,6 +1670,18 @@ void SV_ParseMove(client_t *pSenderClient)
 	sv_player->v.button = cmds[CMD_MOSTRECENT].buttons;
 	sv_player->v.light_level = cmds[CMD_MOSTRECENT].lightlevel;
 #endif // REHLDS_FIXES
+
+#ifdef REHLDS_FIXES
+	// commands lost beyond the backup are replayed from lastcmd (or not run
+	// at all) without passing CUserCmdTimeLimiter::CheckLimits; the moves of
+	// a paused server or a frozen player were zeroed above
+	int newCmdsMsec = 0;
+	for (int i = 0; i < numcmds; i++)
+		newCmdsMsec += cmds[i].msec;
+
+	g_UserCmdTimeLimiter.OnMoveParsed(host_client - g_psvs.clients, net_drop, numbackup, host_client->lastcmd.msec,
+		(g_psv.paused || (sv_player->v.flags & FL_FROZEN)) ? true : false, newCmdsMsec);
+#endif
 
 	SV_EstablishTimeBase(host_client, cmds, net_drop, numbackup, numcmds);
 	SV_RunDroppedCmds(cmds, numcmds, numbackup);
